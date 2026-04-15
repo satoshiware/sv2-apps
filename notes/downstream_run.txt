@@ -1,0 +1,245 @@
+Python + SQLite is the fastest way to ship this.
+
+Here is a clean step-by-step flow you can follow from laptop to scnode, with tests at each step.
+
+1. Create project locally
+Create a new folder and venv.
+Command:
+mkdir -p ~/mining-payout-service
+cd ~/mining-payout-service
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi uvicorn requests python-dotenv apscheduler sqlalchemy alembic pydantic pytest
+
+Test:
+Command:
+python -c "import fastapi, sqlalchemy, requests; print('ok')"
+
+2. Create base files
+Create:
+- app/config.py
+- app/db.py
+- app/models.py
+- app/metrics_parser.py
+- app/pool_client.py
+- app/settlement.py
+- app/scheduler.py
+- app/sender.py
+- app/main.py
+- tests/
+
+Test:
+Command:
+python -c "from pathlib import Path; print(all(Path(p).exists() for p in ['app/config.py','app/db.py','app/main.py']))"
+
+3. Add runtime config
+In .env define:
+- PAYOUT_INTERVAL_MINUTES=10
+- PAYOUT_DECIMALS=8
+- TRANSLATOR_METRICS_URL=http://127.0.0.1:9092/metrics
+- POOL_API_BASE_URL=...
+- POOL_API_KEY=...
+- DB_PATH=./payouts.db
+- DRY_RUN=true
+
+Test:
+Start app in config print mode and verify interval=10, decimals=8.
+
+4. Create SQLite schema
+Use SQLAlchemy models for:
+- users
+- miners
+- metric_snapshots
+- settlements
+- user_payouts
+- payout_events
+- carry_state
+
+Test:
+Create DB and check tables exist.
+Command:
+sqlite3 payouts.db ".tables"
+
+5. Implement miner to user mapping
+Rule:
+- identity format username.worker
+- username is payout owner
+
+Test cases:
+- baveet.miner1 -> user baveet, worker miner1
+- baveet.miner2 -> same user
+- invalid strings rejected and logged
+
+6. Implement translator metrics poller
+Poll every 15 to 30 seconds:
+- GET /metrics
+- parse sv2_server_shares_accepted_total
+- persist counters by identity and timestamp
+
+Test:
+Run poll twice and confirm two snapshot rows inserted.
+
+7. Implement delta logic
+For each identity:
+- delta = current - previous
+- if negative, treat as counter reset, delta=0 and baseline reset
+
+Test:
+Simulate reset sequence and ensure no negative rewards are produced.
+
+8. Implement pool API client
+Fetch period reward from pool API only.
+No estimation fallback.
+
+Test:
+- mock success returns reward value
+- mock timeout marks settlement blocked
+
+9. Implement settlement engine
+Every PAYOUT_INTERVAL_MINUTES:
+- determine window
+- compute user share totals from deltas
+- fetch pool reward for window
+- split by ratio
+- round to 8 decimals
+- carry dust remainder forward
+
+Test:
+Given sample shares and reward:
+- payouts sum + carry equals total exactly to 8 decimals
+
+10. Add idempotency
+For each user payout create:
+- idempotency_key = settlement_id + user_id
+Prevent duplicate inserts/sends on rerun.
+
+Test:
+Run same settlement twice and ensure only one payout record per user.
+
+11. Add payout sender
+For now send to a stub endpoint or just store in payout_events with status pending_sent/sent.
+Later wire wallet backend.
+
+Test:
+- stub receives payload once
+- failed send retries and status updates correctly
+
+12. Add service metrics and health
+Expose:
+- /health
+- /service-metrics
+Include:
+- settlements_total
+- payouts_sent_total
+- payout_failures_total
+- last_settlement_timestamp
+
+Test:
+Call endpoints and verify counters move after one cycle.
+
+13. Run local end to end in DRY_RUN
+Use mocked pool API + fixture metrics.
+Run for 2 to 3 cycles at 10-minute interval.
+
+Test:
+- no crashes
+- settlements created
+- payouts deterministic
+- idempotency holds
+
+14. Deploy to scnode
+Copy code to scnode:
+Command:
+rsync -av ~/mining-payout-service/ satoshi@SCNODE_IP:~/mining-payout-service/
+
+On scnode:
+Command:
+cd ~/mining-payout-service
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+Adjust:
+- TRANSLATOR_METRICS_URL=http://127.0.0.1:9092/metrics
+- DB_PATH=/home/satoshi/mining-payout-service/payouts.db
+- DRY_RUN=true
+
+Test:
+- curl translator metrics works
+- service starts
+- one settlement row appears
+
+15. Production cutover on scnode
+Phase A:
+- DRY_RUN=true for 24h
+Phase B:
+- enable sender to stub endpoint
+Phase C:
+- real payout endpoint
+Phase D:
+- interval from 10 to 2880 minutes
+
+Final tests:
+- 3 consecutive successful settlements
+- zero duplicate payout events
+- reconciliation report matches pool reward totals
+
+If you want, next I can give you a ready project skeleton with exact Python file contents for each module so you can start coding immediately.
+
+
+################################# Distribution handling ###################################################################################ß
+
+Distribution is share-based, per settlement window.
+
+How rewards are distributed
+
+1. Pick a settlement window
+- Example test mode: every 10 minutes
+- Production: every 2 days
+
+2. Get total reward for that window from pool API
+- This is the only reward source of truth
+
+3. Compute each miner’s accepted share delta in that same window
+- From translator counters:
+  sv2_server_shares_accepted_total
+- Delta means:
+  current counter minus previous counter
+
+4. Map miners to users
+- Using identity format username.worker
+- Example:
+  baveet.miner1 and baveet.miner2 both belong to user baveet
+
+5. Aggregate per user
+- user_shares = sum of all that user’s miners’ share deltas
+- total_shares = sum across all users
+
+6. Compute payout ratio and amount
+- user_ratio = user_shares / total_shares
+- user_reward = pool_reward_total * user_ratio
+
+7. Round to 8 decimals
+- Keep any tiny remainder in a carry bucket
+- Add carry in next settlement so nothing is lost
+
+8. Write one payout record per user
+- Not one record per miner
+- Miner breakdown is only for audit
+
+9. Send payout event
+- One idempotent payout event per user per settlement
+- If retried, it must not double-credit
+
+Quick example
+
+- Pool reward in window: 0.01000000 BTC
+- User A shares: 60
+- User B shares: 40
+- Total shares: 100
+
+Then:
+- User A gets 0.00600000 BTC
+- User B gets 0.00400000 BTC
+
+So yes, users with multiple miners naturally get combined payout by summing all their miners first

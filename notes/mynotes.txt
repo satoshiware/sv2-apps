@@ -1,0 +1,92 @@
+Use this sequence.
+
+SSH into SC node
+ssh USER@SCNODE_IP
+
+Install build prerequisites on SC node
+If Ubuntu/Debian:
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev curl git clang cmake
+
+If Fedora/RHEL:
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y openssl-devel curl git clang cmake
+
+Install Rust on SC node
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source $HOME/.cargo/env
+rustc --version
+cargo --version
+
+Clone the same repo on SC node
+mkdir -p $HOME/mining
+cd $HOME/mining
+git clone https://github.com/stratum-mining/sv2-apps.git
+cd sv2-apps
+
+Create translator config on SC node
+mkdir -p $HOME/mining/config
+cat > $HOME/mining/config/tproxy-braiins.toml << EOF
+downstream_address = "0.0.0.0"
+downstream_port = 34255
+
+max_supported_version = 2
+min_supported_version = 2
+downstream_extranonce2_size = 4
+
+user_identity = "baveetstudy"
+aggregate_channels = true
+
+supported_extensions = [
+0x0002,
+]
+
+monitoring_address = "0.0.0.0:9092"
+monitoring_cache_refresh_secs = 15
+
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 10_000_000_000_000.0
+shares_per_minute = 6.0
+enable_vardiff = true
+job_keepalive_interval_secs = 60
+
+[[upstreams]]
+address = "stratum.braiins.com"
+port = 3333
+authority_pubkey = "9awtMD5KQgvRUh2yFbjVeT7b6hjipWcAsQHd6wEhgtDT9soosna"
+EOF
+
+Build translator on SC node
+cd $HOME/mining/sv2-apps/miner-apps/translator
+source $HOME/.cargo/env
+cargo build --release
+
+Run translator on SC node
+cargo run --release -- -c $HOME/mining/config/tproxy-braiins.toml
+
+Point both miners to SC node
+Pool URL:
+stratum+tcp://SCNODE_LAN_IP:34255
+
+Worker can be anything non-empty on each miner (for example:
+baveetstudy.nano1 and baveetstudy.nano2)
+
+
+
+
+
+############
+
+Local testing with less files of the translator
+
+source "$HOME/.cargo/env"
+cd /Users/baveetsinghhora/Desktop/stratumv2/sv2-apps/miner-apps/translator
+cargo run --release -- -c /Users/baveetsinghhora/Desktop/stratumv2/config/tproxy-local.toml
+
+
+
+Braiins token = MmopEkmhscgWqLSd
+
+
+    curl -sS "https://pool.braiins.com/accounts/profile/json/btc/" \
+  -H "Pool-Auth-Token: MmopEkmhscgWqLSd"

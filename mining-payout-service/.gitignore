@@ -1,0 +1,20 @@
+# Python env
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local config / secrets
+.env
+*.ini
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/

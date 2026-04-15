@@ -1,0 +1,69 @@
+Here are the exact test steps and what has been validated so far.
+
+1. Pool client wiring to Braiins format  
+File: test_pool_client.py  
+Validated:
+- Success path with Braiins-style payload btc.daily_rewards and total sum
+- Correct URL path /accounts/rewards/json/btc
+- Correct params from and to as dates
+- Correct auth headers Pool-Auth-Token and X-Pool-Auth-Token
+- Timeout handling
+- HTTP error handling
+- Invalid payload handling
+- Invalid total_reward type handling
+- Non-JSON response handling
+
+2. Metrics polling/parsing  
+Files: test_poller.py, test_delta.py  
+Validated:
+- /metrics parsing of accepted shares
+- Snapshot persistence into metric_snapshots
+- Delta computation across snapshots
+- Reset-safe behavior when counter drops
+- User aggregation from username.worker identities
+
+3. Settlement and reward allocation  
+File: test_settlement.py  
+Validated:
+- Share-ratio reward split
+- 8-decimal rounding behavior
+- Carry remainder conservation
+- Blocked settlement when pool fetch fails
+- Idempotent rerun for same window (no duplicate payouts)
+
+4. Sender/send-once behavior  
+File: test_sender.py  
+Validated:
+- One payout event per payout
+- Send-once idempotency
+- Failure then retry success flow
+- Correct status transitions pending_sent to sent
+
+5. API and service metrics  
+File: test_health.py  
+Validated:
+- /health endpoint
+- /service-metrics counters and last settlement timestamp
+
+6. Schema and mapping basics  
+Files: test_schema.py, test_mapping.py  
+Validated:
+- DB table creation
+- Identity parsing/validation
+- Miner to user mapping behavior
+
+How to run exactly what you asked:
+1. Activate venv
+2. Run only pool client tests:
+```bash
+cd /Users/baveetsinghhora/Desktop/stratumv2/mining-payout-service
+source .venv/bin/activate
+pytest -q tests/test_pool_client.py
+```
+3. Run full suite:
+```bash
+pytest -q
+```
+
+Current status from latest run:
+- 31 tests passed.

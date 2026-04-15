@@ -1,0 +1,30 @@
+downstream_address = "0.0.0.0"
+downstream_port = 34255
+
+max_supported_version = 2
+min_supported_version = 2
+downstream_extranonce2_size = 4
+
+# Keep this here to satisfy the deserializer
+user_identity = "baveetstudy"
+aggregate_channels = true
+
+supported_extensions = [
+    0x0002,
+]
+
+monitoring_address = "0.0.0.0:9092"
+monitoring_cache_refresh_secs = 15
+
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 10_000_000_000_000.0
+shares_per_minute = 6.0
+enable_vardiff = true
+job_keepalive_interval_secs = 60
+
+[[upstreams]]
+# Some versions require it here as well
+user_identity = "baveetstudy"
+address = "stratum.braiins.com"
+port = 3333
+authority_pubkey = "9awtMD5KQgvRUh2yFbjVeT7b6hjipWcAsQHd6wEhgtDT9soosna"
