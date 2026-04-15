@@ -8,6 +8,7 @@ use crate::{
         sv1_server::{
             channel::Sv1ServerChannelState, is_mining_authorize, KEEPALIVE_JOB_ID_DELIMITER,
         },
+        SharedShareStats,
     },
     utils::AGGREGATED_CHANNEL_ID,
 };
@@ -85,6 +86,8 @@ pub struct Sv1Server {
     /// Valid Sv1 jobs storage, containing only a single shared entry (AGGREGATED_CHANNEL_ID) in
     /// case of channels aggregation (aggregated mode)
     pub(crate) valid_sv1_jobs: Arc<DashMap<ChannelId, Vec<server_to_client::Notify<'static>>>>,
+    /// Local per-identity share stats used for monitoring and payout attribution.
+    pub(crate) share_stats: SharedShareStats,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -153,6 +156,7 @@ impl Sv1Server {
         self.pending_target_updates
             .safe_lock(|updates| updates.clear())
             .ok();
+        self.share_stats.clear();
         self.sv1_server_channel_state.drop();
     }
 
@@ -171,6 +175,7 @@ impl Sv1Server {
         channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
         channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         config: TranslatorConfig,
+        share_stats: SharedShareStats,
     ) -> Self {
         let shares_per_minute = config.downstream_difficulty_config.shares_per_minute;
         let sv1_server_channel_state =
@@ -192,6 +197,7 @@ impl Sv1Server {
             prevhashes: Arc::new(DashMap::new()),
             pending_target_updates: Arc::new(Mutex::new(Vec::new())),
             valid_sv1_jobs: Arc::new(DashMap::new()),
+            share_stats,
         }
     }
 
@@ -509,37 +515,38 @@ impl Sv1Server {
         )
         .map_err(|_| TproxyError::shutdown(TproxyErrorKind::SV1Error))?;
 
-        // Only add TLV fields with user identity in non-aggregated mode
-        let tlv_fields = if is_non_aggregated() {
-            let Some(downstream) = self
-                .downstreams
-                .get(&message.downstream_id)
-                .map(|r| r.value().clone())
-            else {
-                warn!(
-                    "Downstream {} disconnected before share could be submitted, dropping share",
-                    message.downstream_id
-                );
-                return Ok(());
-            };
-            let user_identity = downstream
-                .downstream_data
-                .super_safe_lock(|d| d.user_identity.clone());
-            // Considering we are trucating user identity to 32 bytes,
-            // If an error happen we should disconnect the downstream.
-            UserIdentity::new(&user_identity)
-                .map_err(|e| {
-                    TproxyError::disconnect(
-                        TproxyErrorKind::General(e.into()),
-                        message.downstream_id,
-                    )
-                })?
-                .to_tlv()
-                .ok()
-                .map(|tlv| vec![tlv])
-        } else {
-            None
+        let Some(downstream) = self
+            .downstreams
+            .get(&message.downstream_id)
+            .map(|r| r.value().clone())
+        else {
+            warn!(
+                "Downstream {} disconnected before share could be submitted, dropping share",
+                message.downstream_id
+            );
+            return Ok(());
         };
+        let user_identity = downstream
+            .downstream_data
+            .super_safe_lock(|d| d.user_identity.clone());
+
+        if !user_identity.is_empty() {
+            let mut stats = self.share_stats.entry(user_identity.clone()).or_default();
+            stats.shares_submitted += 1;
+        }
+
+        // Always attach the internal UserIdentity TLV so the ChannelManager can
+        // preserve local per-user accounting even when upstream aggregation is enabled.
+        let tlv_fields = UserIdentity::new(&user_identity)
+            .map_err(|e| {
+                TproxyError::disconnect(
+                    TproxyErrorKind::General(e.into()),
+                    message.downstream_id,
+                )
+            })?
+            .to_tlv()
+            .ok()
+            .map(|tlv| vec![tlv]);
 
         self.sv1_server_channel_state
             .channel_manager_sender
@@ -1380,7 +1387,7 @@ mod tests {
         let config = create_test_config();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        Sv1Server::new(addr, cm_receiver, cm_sender, config)
+        Sv1Server::new(addr, cm_receiver, cm_sender, config, Arc::new(DashMap::new()))
     }
 
     #[test]
@@ -1402,7 +1409,8 @@ mod tests {
         let (_downstream_sender, cm_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server =
+            Sv1Server::new(addr, cm_receiver, cm_sender, config, Arc::new(DashMap::new()));
 
         assert!(server.config.downstream_difficulty_config.enable_vardiff);
     }
@@ -1443,7 +1451,8 @@ mod tests {
         let (_downstream_sender, cm_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server =
+            Sv1Server::new(addr, cm_receiver, cm_sender, config, Arc::new(DashMap::new()));
         let target: Target = hash_rate_to_target(200.0, 5.0).unwrap();
 
         let set_target = SetTarget {
@@ -1464,7 +1473,8 @@ mod tests {
         let (_downstream_sender, cm_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server =
+            Sv1Server::new(addr, cm_receiver, cm_sender, config, Arc::new(DashMap::new()));
         let target: Target = hash_rate_to_target(200.0, 5.0).unwrap();
 
         let set_target = SetTarget {

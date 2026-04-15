@@ -757,6 +757,9 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
     if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
         metric.reset();
     }
+    if let Some(ref metric) = state.metrics.sv1_client_shares_accepted_total {
+        metric.reset();
+    }
 
     // Collect server metrics
     if let Some(ref summary) = snapshot.server_summary {
@@ -900,6 +903,17 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
     }
 
+    if let Some(ref clients) = snapshot.sv1_clients {
+        for client in clients {
+            let client_id = client.client_id.to_string();
+            if let Some(ref metric) = state.metrics.sv1_client_shares_accepted_total {
+                metric
+                    .with_label_values(&[&client_id, &client.user_identity])
+                    .set(client.shares_accepted as f64);
+            }
+        }
+    }
+
     // Encode and return metrics
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
@@ -1032,6 +1046,7 @@ mod tests {
             user_identity: format!("miner-{}", id),
             target_hex: "00ff".into(),
             hashrate,
+            shares_accepted: id as u64,
             extranonce1_hex: "aabb".into(),
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),

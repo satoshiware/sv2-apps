@@ -11,6 +11,18 @@
 //! - [`diff_management`]: (Declared here, likely contains downstream difficulty logic)
 //! - [`downstream`]: Defines the core [`Downstream`] struct and its functionalities.
 
+use dashmap::DashMap;
+use std::sync::Arc;
+
 pub mod downstream;
 pub mod sv1_server;
 pub use sv1_server::sv1_server::Sv1Server;
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareStats {
+    pub shares_submitted: u64,
+    pub shares_accepted: u64,
+    pub shares_rejected: u64,
+}
+
+pub type SharedShareStats = Arc<DashMap<String, ShareStats>>;

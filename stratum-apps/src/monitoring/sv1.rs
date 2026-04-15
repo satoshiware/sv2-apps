@@ -15,6 +15,7 @@ pub struct Sv1ClientInfo {
     pub user_identity: String,
     pub target_hex: String,
     pub hashrate: Option<f32>,
+    pub shares_accepted: u64,
     pub extranonce1_hex: String,
     pub extranonce2_len: usize,
     pub version_rolling_mask: Option<String>,
@@ -26,6 +27,7 @@ pub struct Sv1ClientInfo {
 pub struct Sv1ClientsSummary {
     pub total_clients: usize,
     pub total_hashrate: f32,
+    pub total_accepted_shares: u64,
 }
 
 /// Trait for monitoring SV1 client connections
@@ -50,6 +52,7 @@ pub trait Sv1ClientsMonitoring: Send + Sync {
         Sv1ClientsSummary {
             total_clients: clients.len(),
             total_hashrate: clients.iter().filter_map(|c| c.hashrate).sum(),
+            total_accepted_shares: clients.iter().map(|c| c.shares_accepted).sum(),
         }
     }
 }
@@ -58,7 +61,7 @@ pub trait Sv1ClientsMonitoring: Send + Sync {
 mod tests {
     use super::*;
 
-    fn create_sv1_client_info(id: usize, hashrate: Option<f32>) -> Sv1ClientInfo {
+    fn create_sv1_client_info(id: usize, hashrate: Option<f32>, shares_accepted: u64) -> Sv1ClientInfo {
         Sv1ClientInfo {
             client_id: id,
             channel_id: Some(id as u32),
@@ -66,6 +69,7 @@ mod tests {
             user_identity: format!("miner-{}", id),
             target_hex: "00ff".into(),
             hashrate,
+            shares_accepted,
             extranonce1_hex: "aabb".into(),
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),
@@ -83,8 +87,8 @@ mod tests {
     #[test]
     fn sv1_get_client_by_id_found() {
         let monitor = MockSv1Clients(vec![
-            create_sv1_client_info(1, Some(10.0)),
-            create_sv1_client_info(2, Some(20.0)),
+            create_sv1_client_info(1, Some(10.0), 3),
+            create_sv1_client_info(2, Some(20.0), 5),
         ]);
         let found = monitor.get_sv1_client_by_id(2);
         assert!(found.is_some());
@@ -93,7 +97,7 @@ mod tests {
 
     #[test]
     fn sv1_get_client_by_id_not_found() {
-        let monitor = MockSv1Clients(vec![create_sv1_client_info(1, Some(10.0))]);
+        let monitor = MockSv1Clients(vec![create_sv1_client_info(1, Some(10.0), 3)]);
         assert!(monitor.get_sv1_client_by_id(999).is_none());
     }
 
@@ -108,12 +112,13 @@ mod tests {
     #[test]
     fn sv1_summary_skips_none_hashrate() {
         let monitor = MockSv1Clients(vec![
-            create_sv1_client_info(1, Some(100.0)),
-            create_sv1_client_info(2, None),
-            create_sv1_client_info(3, Some(50.0)),
+            create_sv1_client_info(1, Some(100.0), 2),
+            create_sv1_client_info(2, None, 7),
+            create_sv1_client_info(3, Some(50.0), 11),
         ]);
         let summary = monitor.get_sv1_clients_summary();
         assert_eq!(summary.total_clients, 3);
         assert_eq!(summary.total_hashrate, 150.0);
+        assert_eq!(summary.total_accepted_shares, 20);
     }
 }

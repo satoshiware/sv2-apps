@@ -406,6 +406,28 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             ch.on_share_acknowledgement(m.new_submits_accepted_count, m.new_shares_sum as f64);
         }
 
+        let mut accepted_sequences: Vec<(u32, String)> = self
+            .pending_share_identities
+            .iter()
+            .filter_map(|entry| {
+                let ((channel_id, sequence_number), identity) = entry.pair();
+                if *channel_id == m.channel_id && *sequence_number <= m.last_sequence_number {
+                    Some((*sequence_number, identity.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        accepted_sequences.sort_by_key(|(sequence_number, _)| *sequence_number);
+
+        let accepted_count = m.new_submits_accepted_count as usize;
+        for (sequence_number, identity) in accepted_sequences.into_iter().take(accepted_count) {
+            self.pending_share_identities
+                .remove(&(m.channel_id, sequence_number));
+            let mut stats = self.share_stats.entry(identity).or_default();
+            stats.shares_accepted += 1;
+        }
+
         Ok(())
     }
 
@@ -426,6 +448,14 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         // if None, the channel may be closed/missing, so we ignore this accounting update
         if let Some(mut ch) = self.extended_channels.get_mut(&key) {
             ch.on_share_rejection();
+        }
+
+        if let Some((_, identity)) = self
+            .pending_share_identities
+            .remove(&(m.channel_id, m.sequence_number))
+        {
+            let mut stats = self.share_stats.entry(identity).or_default();
+            stats.shares_rejected += 1;
         }
 
         Ok(())

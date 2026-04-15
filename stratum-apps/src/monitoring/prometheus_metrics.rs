@@ -25,6 +25,7 @@ pub struct PrometheusMetrics {
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    pub sv1_client_shares_accepted_total: Option<GaugeVec>,
 }
 
 impl PrometheusMetrics {
@@ -156,16 +157,25 @@ impl PrometheusMetrics {
         };
 
         // SV1 metrics
-        let (sv1_clients_total, sv1_hashrate_total) = if enable_sv1_metrics {
+        let (sv1_clients_total, sv1_hashrate_total, sv1_client_shares_accepted_total) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
 
-            (Some(clients), Some(hashrate))
+            let shares_accepted = GaugeVec::new(
+                Opts::new(
+                    "sv1_client_shares_accepted_total",
+                    "Total accepted shares per SV1 client identity",
+                ),
+                &["client_id", "user_identity"],
+            )?;
+            registry.register(Box::new(shares_accepted.clone()))?;
+
+            (Some(clients), Some(hashrate), Some(shares_accepted))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
@@ -184,6 +194,7 @@ impl PrometheusMetrics {
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv1_client_shares_accepted_total,
         })
     }
 }
@@ -233,6 +244,7 @@ mod tests {
         let m = PrometheusMetrics::new(false, false, true).unwrap();
         assert!(m.sv1_clients_total.is_some());
         assert!(m.sv1_hashrate_total.is_some());
+        assert!(m.sv1_client_shares_accepted_total.is_some());
         // server and clients should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv2_clients_total.is_none());

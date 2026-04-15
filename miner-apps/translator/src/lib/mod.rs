@@ -12,6 +12,7 @@
 //! etc.) for specialized functionalities.
 #![allow(clippy::module_inception)]
 use async_channel::{unbounded, Receiver, Sender};
+use dashmap::DashMap;
 use std::{
     net::SocketAddr,
     sync::{
@@ -124,12 +125,14 @@ impl TranslatorSv2 {
             self.config.downstream_address.parse().unwrap(),
             self.config.downstream_port,
         );
+        let share_stats = Arc::new(DashMap::new());
 
         let mut sv1_server = Arc::new(Sv1Server::new(
             downstream_addr,
             channel_manager_to_sv1_server_receiver,
             sv1_server_to_channel_manager_sender,
             self.config.clone(),
+            share_stats.clone(),
         ));
 
         info!("Initializing upstream connection...");
@@ -162,6 +165,7 @@ impl TranslatorSv2 {
             status_sender.clone(),
             self.config.supported_extensions.clone(),
             self.config.required_extensions.clone(),
+            share_stats.clone(),
         ));
 
         info!("Launching ChannelManager tasks...");
@@ -278,11 +282,14 @@ impl TranslatorSv2 {
                                 let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
                                     unbounded();
 
+                                let share_stats = Arc::new(DashMap::new());
+
                                 sv1_server = Arc::new(Sv1Server::new(
                                     downstream_addr,
                                     channel_manager_to_sv1_server_receiver,
                                     sv1_server_to_channel_manager_sender,
                                     self.config.clone(),
+                                    share_stats.clone(),
                                 ));
 
                                 if let Err(e) = self.initialize_upstream(
@@ -309,6 +316,7 @@ impl TranslatorSv2 {
                                     status_sender.clone(),
                                     self.config.supported_extensions.clone(),
                                     self.config.required_extensions.clone(),
+                                    share_stats.clone(),
                                 ));
 
                                 info!("Launching ChannelManager tasks...");

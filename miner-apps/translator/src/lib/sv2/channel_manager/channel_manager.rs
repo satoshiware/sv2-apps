@@ -2,6 +2,7 @@ use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     is_aggregated,
     status::{handle_error, Status, StatusSender},
+    sv1::SharedShareStats,
     sv2::channel_manager::channel::ChannelState,
     utils::{AggregatedState, AtomicAggregatedState, AGGREGATED_CHANNEL_ID},
 };
@@ -14,11 +15,13 @@ use stratum_apps::{
     stratum_core::{
         channels_sv2::client::{extended::ExtendedChannel, group::GroupChannel},
         codec_sv2::StandardSv2Frame,
-        extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
+        extensions_sv2::{
+            UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+        },
         framing_sv2,
         handlers_sv2::{HandleExtensionsFromServerAsync, HandleMiningMessagesFromServerAsync},
         mining_sv2::{ExtendedExtranonce, OpenExtendedMiningChannelSuccess},
-        parsers_sv2::{AnyMessage, Mining, Tlv, TlvList},
+        parsers_sv2::{AnyMessage, Mining, Tlv, TlvField, TlvList},
     },
     task_manager::TaskManager,
     utils::{
@@ -89,6 +92,11 @@ pub struct ChannelManager {
     pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
     /// Extranonce factories containing per channel extranonces
     pub extranonce_factories: Arc<DashMap<ChannelId, ExtendedExtranonce>>,
+    /// Pending submitted shares keyed by (upstream channel_id, sequence_number) so acks can be
+    /// mapped back to the original user identity.
+    pub pending_share_identities: Arc<DashMap<(u32, u32), String>>,
+    /// Shared local per-identity share stats used for monitoring and payout attribution.
+    pub share_stats: SharedShareStats,
     /// Tracks whether the single upstream channel in aggregated mode is absent,
     /// being established, or connected.
     pub aggregated_channel_state: AtomicAggregatedState,
@@ -120,6 +128,7 @@ impl ChannelManager {
         status_sender: Sender<Status>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        share_stats: SharedShareStats,
     ) -> Self {
         let channel_state = ChannelState::new(
             upstream_sender,
@@ -139,6 +148,8 @@ impl ChannelManager {
             share_sequence_counters: Arc::new(DashMap::new()),
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
             extranonce_factories: Arc::new(DashMap::new()),
+            pending_share_identities: Arc::new(DashMap::new()),
+            share_stats,
             aggregated_channel_state: AtomicAggregatedState::new(AggregatedState::NoChannel),
         }
     }
@@ -480,6 +491,20 @@ impl ChannelManager {
                         }
                     }
 
+                    if let Some(user_identity) = tlv_fields.as_ref().and_then(|tlvs| {
+                        tlvs.iter()
+                            .find(|tlv| {
+                                tlv.r#type.extension_type
+                                    == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
+                                    && tlv.r#type.field_type == TLV_FIELD_TYPE_USER_IDENTITY
+                            })
+                            .and_then(|tlv| UserIdentity::from_tlv(tlv).ok())
+                            .map(|identity| identity.as_string_or_hex())
+                    }) {
+                        self.pending_share_identities
+                            .insert((m.channel_id, m.sequence_number), user_identity);
+                    }
+
                     // Send the share upstream (common for both aggregated and non-aggregated modes)
                     let contains_type_in_negotiated_extension =
                         self.negotiated_extensions.super_safe_lock(|data| {
@@ -810,6 +835,7 @@ mod tests {
             status_sender,
             vec![],
             vec![],
+            Arc::new(DashMap::new()),
         )
     }
 

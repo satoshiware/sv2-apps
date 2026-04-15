@@ -6,7 +6,10 @@ use stratum_apps::monitoring::sv1::{Sv1ClientInfo, Sv1ClientsMonitoring};
 use crate::sv1::{downstream::downstream::Downstream, sv1_server::sv1_server::Sv1Server};
 
 /// Helper to convert a Downstream to Sv1ClientInfo
-fn downstream_to_sv1_client_info(downstream: &Downstream) -> Option<Sv1ClientInfo> {
+fn downstream_to_sv1_client_info(
+    downstream: &Downstream,
+    shares_accepted: u64,
+) -> Option<Sv1ClientInfo> {
     downstream
         .downstream_data
         .safe_lock(|dd| Sv1ClientInfo {
@@ -16,6 +19,7 @@ fn downstream_to_sv1_client_info(downstream: &Downstream) -> Option<Sv1ClientInf
             user_identity: dd.user_identity.clone(),
             target_hex: hex::encode(dd.target.to_be_bytes()),
             hashrate: dd.hashrate,
+            shares_accepted,
             extranonce1_hex: hex::encode(&dd.extranonce1),
             extranonce2_len: dd.extranonce2_len,
             version_rolling_mask: dd
@@ -34,13 +38,37 @@ impl Sv1ClientsMonitoring for Sv1Server {
     fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
         self.downstreams
             .iter()
-            .filter_map(|downstream| downstream_to_sv1_client_info(downstream.value()))
+            .filter_map(|downstream| {
+                let shares_accepted = downstream
+                    .value()
+                    .downstream_data
+                    .safe_lock(|dd| {
+                        self.share_stats
+                            .get(&dd.user_identity)
+                            .map(|stats| stats.shares_accepted)
+                            .unwrap_or(0)
+                    })
+                    .ok()
+                    .unwrap_or(0);
+                downstream_to_sv1_client_info(downstream.value(), shares_accepted)
+            })
             .collect()
     }
 
     fn get_sv1_client_by_id(&self, client_id: usize) -> Option<Sv1ClientInfo> {
-        self.downstreams
-            .get(&client_id)
-            .and_then(|downstream| downstream_to_sv1_client_info(downstream.value()))
+        self.downstreams.get(&client_id).and_then(|downstream| {
+            let shares_accepted = downstream
+                .value()
+                .downstream_data
+                .safe_lock(|dd| {
+                    self.share_stats
+                        .get(&dd.user_identity)
+                        .map(|stats| stats.shares_accepted)
+                        .unwrap_or(0)
+                })
+                .ok()
+                .unwrap_or(0);
+            downstream_to_sv1_client_info(downstream.value(), shares_accepted)
+        })
     }
 }
