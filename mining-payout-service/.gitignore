@@ -10,7 +10,11 @@ __pycache__/
 
 # Local config / secrets
 .env
-*.ini
+.env.*
+*.local.ini
+
+# Local databases
+*.db
 
 # Logs
 *.log
