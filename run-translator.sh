@@ -3,9 +3,11 @@ set -u
 
 source "$HOME/.cargo/env"
 
-APP_DIR="/Users/baveetsinghhora/Desktop/stratumv2/sv2-apps/miner-apps/translator"
-CFG="/Users/baveetsinghhora/Desktop/stratumv2/config/tproxy-local.toml"
-LOG_DIR="/Users/baveetsinghhora/Desktop/stratumv2/logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$SCRIPT_DIR"
+APP_DIR="$REPO_DIR/miner-apps/translator"
+CFG="$REPO_DIR/config/tproxy-local.toml"
+LOG_DIR="$REPO_DIR/logs"
 
 mkdir -p "$LOG_DIR"
 
