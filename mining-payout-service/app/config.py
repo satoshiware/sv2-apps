@@ -1,0 +1,85 @@
+from dataclasses import dataclass
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if (PROJECT_ROOT / ".env").exists():
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
+else:
+    load_dotenv(PROJECT_ROOT / ".env.example", override=True)
+
+DEFAULT_DB_PATH = str(PROJECT_ROOT / "payouts.db")
+DEFAULT_AUDIT_LOG_PATH = str(PROJECT_ROOT / "logs" / "payout_audit.jsonl")
+
+
+def _resolve_path(path_value: str, default_path: str) -> str:
+    value = (path_value or "").strip() or default_path
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str(path.resolve())
+
+
+def _parse_env_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+@dataclass(frozen=True)
+class Settings:
+    payout_interval_minutes: int = 10
+    payout_decimals: int = 8
+    fixed_reward_btc: str = ""
+    pool_reward_url: str = ""
+    pool_api_base_url: str = ""
+    pool_api_key: str = ""
+    reward_mode: str = "blocks"
+    block_reward_btc: str = "1.87500000"
+    translator_metrics_url: str = "http://127.0.0.1:9092/metrics"
+    translator_channels_url: str = ""
+    translator_downstreams_url: str = ""
+    translator_bearer_token: str = ""
+    payout_audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
+    scheduler_enabled: bool = False
+    scheduler_interval_seconds: int = 60
+    db_path: str = DEFAULT_DB_PATH
+    dry_run: bool = True
+
+
+def load_settings() -> Settings:
+    resolved_db_path = _resolve_path(os.getenv("DB_PATH", DEFAULT_DB_PATH), DEFAULT_DB_PATH)
+    resolved_audit_log_path = _resolve_path(
+        os.getenv("PAYOUT_AUDIT_LOG_PATH", DEFAULT_AUDIT_LOG_PATH),
+        DEFAULT_AUDIT_LOG_PATH,
+    )
+
+    return Settings(
+        payout_interval_minutes=int(os.getenv("PAYOUT_INTERVAL_MINUTES", "10")),
+        payout_decimals=int(os.getenv("PAYOUT_DECIMALS", "8")),
+        fixed_reward_btc=os.getenv("FIXED_REWARD_BTC", ""),
+        pool_reward_url=os.getenv("POOL_REWARD_URL", ""),
+        pool_api_base_url=os.getenv("POOL_API_BASE_URL", ""),
+        pool_api_key=os.getenv("POOL_API_KEY", ""),
+        reward_mode=os.getenv("REWARD_MODE", "blocks"),
+        block_reward_btc=os.getenv("BLOCK_REWARD_BTC", "1.87500000"),
+        translator_metrics_url=os.getenv("TRANSLATOR_METRICS_URL", "http://127.0.0.1:9092/metrics"),
+        translator_channels_url=os.getenv("TRANSLATOR_CHANNELS_URL", ""),
+        translator_downstreams_url=os.getenv("TRANSLATOR_DOWNSTREAMS_URL", ""),
+        translator_bearer_token=os.getenv("TRANSLATOR_BEARER_TOKEN", ""),
+        payout_audit_log_path=resolved_audit_log_path,
+        scheduler_enabled=_parse_env_bool(os.getenv("SCHEDULER_ENABLED"), default=False),
+        scheduler_interval_seconds=int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60")),
+        db_path=resolved_db_path,
+        dry_run=_parse_env_bool(os.getenv("DRY_RUN"), default=True),
+    )

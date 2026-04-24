@@ -1,0 +1,30 @@
+# Override parent repo *.py ignore for this Python service
+!*.py
+!**/*.py
+
+# Python env
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local config / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+*.local.ini
+
+# Local databases
+*.db
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
