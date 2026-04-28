@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from app.db import Base, make_engine, make_session_factory
-from app.models import MetricSnapshot
-from app.poller import poll_channels_once, poll_metrics_once
+from app.models import MetricSnapshot, SnapshotBlock
+from app.poller import poll_channels_once, poll_metrics_once, upsert_snapshot_blocks
 
 
 class _Response:
@@ -227,3 +227,62 @@ def test_poll_channels_once_prefers_downstream_identity_by_channel(monkeypatch, 
         (2, "baveet.worker3"),
         (3, "Ben.Cust1"),
     ]
+
+
+def test_upsert_snapshot_blocks_creates_rows_from_blocks_payload(session) -> None:
+    created = upsert_snapshot_blocks(
+        session,
+        [
+            {
+                "detected_time": 1777314807,
+                "channel_id": 2,
+                "worker_identity": "Ben.Cust1",
+                "blockhash": "000000abc",
+            }
+        ],
+    )
+
+    assert created == 1
+    all_rows = session.query(SnapshotBlock).all()
+    assert len(all_rows) == 1
+    assert all_rows[0].blockhash == "000000abc"
+    assert all_rows[0].channel_id == 2
+    assert all_rows[0].worker_identity == "Ben.Cust1"
+    assert all_rows[0].source == "translator_blocks_api"
+
+
+def test_upsert_snapshot_blocks_is_idempotent_by_blockhash(session) -> None:
+    payload = [
+        {
+            "detected_time": 1777314807,
+            "channel_id": 2,
+            "worker_identity": "Ben.Cust1",
+            "blockhash": "000000dup",
+            "source": "translator_api",
+        }
+    ]
+
+    created_first = upsert_snapshot_blocks(session, payload)
+    created_second = upsert_snapshot_blocks(session, payload)
+
+    assert created_first == 1
+    assert created_second == 0
+    assert session.query(SnapshotBlock).count() == 1
+
+
+def test_upsert_snapshot_blocks_skips_null_blockhash(session) -> None:
+    """Rows with blockhash=null (unresolved) are silently skipped by the normalizer."""
+    created = upsert_snapshot_blocks(
+        session,
+        [
+            {
+                "detected_time": 1777403179,
+                "channel_id": 2,
+                "worker_identity": "Ben.Cust1",
+                "blockhash": None,
+                "blockhash_status": "unresolved",
+            }
+        ],
+    )
+    assert created == 0
+    assert session.query(SnapshotBlock).count() == 0

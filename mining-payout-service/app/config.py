@@ -46,10 +46,22 @@ class Settings:
     pool_api_key: str = ""
     reward_mode: str = "blocks"
     block_reward_btc: str = "1.87500000"
+    enable_block_event_rewards: bool = False
+    maturity_window_minutes: int = 200
+    block_reward_batch_url: str = ""
+    block_reward_batch_timeout_seconds: int = 10
+    defer_on_zero_matured_reward: bool = True
+    translator_blocks_found_url: str = ""
+    translator_blocks_found_timeout_seconds: int = 10
+    translator_blocks_found_limit: int = 100
     translator_metrics_url: str = "http://127.0.0.1:9092/metrics"
     translator_channels_url: str = ""
     translator_downstreams_url: str = ""
     translator_bearer_token: str = ""
+    enable_startup_reconciliation_hook: bool = False
+    enable_block_event_replay_hook: bool = False
+    enable_reward_refetch_hook: bool = False
+    enable_settlement_replay_hook: bool = False
     payout_audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 60
@@ -73,10 +85,44 @@ def load_settings() -> Settings:
         pool_api_key=os.getenv("POOL_API_KEY", ""),
         reward_mode=os.getenv("REWARD_MODE", "blocks"),
         block_reward_btc=os.getenv("BLOCK_REWARD_BTC", "1.87500000"),
+        enable_block_event_rewards=_parse_env_bool(
+            os.getenv("ENABLE_BLOCK_EVENT_REWARDS"),
+            default=False,
+        ),
+        maturity_window_minutes=int(os.getenv("MATURITY_WINDOW_MINUTES", "200")),
+        block_reward_batch_url=os.getenv("BLOCK_REWARD_BATCH_URL", ""),
+        block_reward_batch_timeout_seconds=int(
+            os.getenv("BLOCK_REWARD_BATCH_TIMEOUT_SECONDS", "10")
+        ),
+        defer_on_zero_matured_reward=_parse_env_bool(
+            os.getenv("DEFER_ON_ZERO_MATURED_REWARD"),
+            default=True,
+        ),
+        translator_blocks_found_url=os.getenv("TRANSLATOR_BLOCKS_FOUND_URL", ""),
+        translator_blocks_found_timeout_seconds=int(
+            os.getenv("TRANSLATOR_BLOCKS_FOUND_TIMEOUT_SECONDS", "10")
+        ),
+        translator_blocks_found_limit=int(os.getenv("TRANSLATOR_BLOCKS_FOUND_LIMIT", "100")),
         translator_metrics_url=os.getenv("TRANSLATOR_METRICS_URL", "http://127.0.0.1:9092/metrics"),
         translator_channels_url=os.getenv("TRANSLATOR_CHANNELS_URL", ""),
         translator_downstreams_url=os.getenv("TRANSLATOR_DOWNSTREAMS_URL", ""),
         translator_bearer_token=os.getenv("TRANSLATOR_BEARER_TOKEN", ""),
+        enable_startup_reconciliation_hook=_parse_env_bool(
+            os.getenv("ENABLE_STARTUP_RECONCILIATION_HOOK"),
+            default=False,
+        ),
+        enable_block_event_replay_hook=_parse_env_bool(
+            os.getenv("ENABLE_BLOCK_EVENT_REPLAY_HOOK"),
+            default=False,
+        ),
+        enable_reward_refetch_hook=_parse_env_bool(
+            os.getenv("ENABLE_REWARD_REFETCH_HOOK"),
+            default=False,
+        ),
+        enable_settlement_replay_hook=_parse_env_bool(
+            os.getenv("ENABLE_SETTLEMENT_REPLAY_HOOK"),
+            default=False,
+        ),
         payout_audit_log_path=resolved_audit_log_path,
         scheduler_enabled=_parse_env_bool(os.getenv("SCHEDULER_ENABLED"), default=False),
         scheduler_interval_seconds=int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60")),

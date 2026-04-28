@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 import json
 from pathlib import Path
+import shutil
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -266,6 +267,20 @@ def write_payout_audit_log(log_path: str, event: dict[str, object]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(payload)
         handle.write("\n")
+
+def rotate_payout_audit_log(path: str) -> str | None:
+    log_path = Path(path)
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return None
+
+    archive_dir = log_path.parent / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_name = f"{log_path.stem}.{timestamp}{log_path.suffix}"
+    archive_path = archive_dir / archive_name
+    shutil.move(str(log_path), str(archive_path))
+    return str(archive_path)
 
 
 def read_recent_audit_entries(log_path: str, limit: int = 50) -> dict[str, object]:

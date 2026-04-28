@@ -91,3 +91,32 @@ class BlockCounterState(Base):
     channel_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
     last_blocks_found_total: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class SnapshotBlock(Base):
+    __tablename__ = "snapshot_block"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    found_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    channel_id: Mapped[int] = mapped_column(Integer, index=True)
+    worker_identity: Mapped[str] = mapped_column(String(256), index=True)
+    blockhash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(64), default="translator_log")
+    reward_sats: Mapped[int] = mapped_column(Integer, nullable=True)
+    reward_fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=True, index=True)
+    settlement_id: Mapped[int] = mapped_column(
+        ForeignKey("settlements.id"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class WorkAccrualBucket(Base):
+    __tablename__ = "work_accrual_bucket"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    accumulated_work: Mapped[Decimal] = mapped_column(Numeric(28, 8), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)

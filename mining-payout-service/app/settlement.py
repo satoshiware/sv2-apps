@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import load_settings
 from app.delta import UserContribution, compute_user_contribution_deltas
-from app.models import CarryState, Settlement, User, UserPayout
+from app.models import CarryState, Settlement, User, UserPayout, WorkAccrualBucket
 from app.pool_client import PoolApiError, fetch_pool_reward
 
 ZERO = Decimal("0")
@@ -20,6 +20,8 @@ class SettlementResult:
     settlement_id: int
     status: str
     user_count: int
+    period_start: datetime
+    period_end: datetime
     total_shares: int
     total_work: Decimal
     pool_reward_btc: Decimal
@@ -49,6 +51,100 @@ def _get_or_create_carry(session: Session, bucket: str = "default") -> CarryStat
     return carry
 
 
+def _get_or_create_accrual_bucket(session: Session, user: User) -> WorkAccrualBucket:
+    bucket = session.execute(
+        select(WorkAccrualBucket).where(WorkAccrualBucket.user_id == user.id)
+    ).scalar_one_or_none()
+    if bucket is None:
+        bucket = WorkAccrualBucket(user_id=user.id, accumulated_work=ZERO)
+        session.add(bucket)
+        session.flush()
+    return bucket
+
+
+def _add_work_to_accrual(
+    session: Session,
+    user_contributions: dict[str, UserContribution],
+    now: datetime,
+    decimals: int,
+) -> None:
+    """Add current interval work deltas into WorkAccrualBucket for all users with positive work."""
+    now_naive = now.replace(tzinfo=None) if hasattr(now, "tzinfo") and now.tzinfo else now
+    for username, contribution in user_contributions.items():
+        if contribution.work_delta <= ZERO:
+            continue
+        user = _get_or_create_user(session, username)
+        accrual = _get_or_create_accrual_bucket(session, user)
+        accrual.accumulated_work = _q(
+            Decimal(str(accrual.accumulated_work or 0)) + contribution.work_delta,
+            decimals,
+        )
+        accrual.updated_at = now_naive
+    session.flush()
+
+
+def _apply_accrual_to_contributions(
+    session: Session,
+    user_contributions: dict[str, UserContribution],
+) -> dict[str, UserContribution]:
+    """Return a new contributions dict where each user's work_delta is increased by their accrued work."""
+    enhanced: dict[str, UserContribution] = {
+        username: UserContribution(
+            username=username,
+            share_delta=contribution.share_delta,
+            work_delta=contribution.work_delta,
+        )
+        for username, contribution in user_contributions.items()
+    }
+
+    accrual_rows = session.execute(select(WorkAccrualBucket)).scalars().all()
+    for bucket in accrual_rows:
+        accrued = Decimal(str(bucket.accumulated_work or 0))
+        if accrued <= ZERO:
+            continue
+
+        user = session.execute(select(User).where(User.id == bucket.user_id)).scalar_one_or_none()
+        if user is None:
+            continue
+
+        existing = enhanced.get(user.username)
+        if existing is None:
+            enhanced[user.username] = UserContribution(
+                username=user.username,
+                share_delta=0,
+                work_delta=accrued,
+            )
+            continue
+
+        enhanced[user.username] = UserContribution(
+            username=user.username,
+            share_delta=existing.share_delta,
+            work_delta=existing.work_delta + accrued,
+        )
+
+    return enhanced
+
+
+def _clear_accrual_for_users(
+    session: Session,
+    usernames: list[str],
+    now: datetime,
+) -> None:
+    """Zero out accumulated work for users who received payouts in this cycle."""
+    now_naive = now.replace(tzinfo=None) if hasattr(now, "tzinfo") and now.tzinfo else now
+    for username in usernames:
+        user = session.execute(select(User).where(User.username == username)).scalar_one_or_none()
+        if user is None:
+            continue
+        bucket = session.execute(
+            select(WorkAccrualBucket).where(WorkAccrualBucket.user_id == user.id)
+        ).scalar_one_or_none()
+        if bucket is not None and Decimal(str(bucket.accumulated_work or 0)) > ZERO:
+            bucket.accumulated_work = ZERO
+            bucket.updated_at = now_naive
+    session.flush()
+
+
 def _summarize_contributions(
     user_contributions: dict[str, UserContribution],
 ) -> tuple[int, Decimal]:
@@ -68,6 +164,8 @@ def _result_from_existing_settlement(session: Session, settlement: Settlement) -
         settlement_id=settlement.id,
         status=settlement.status,
         user_count=user_count,
+        period_start=settlement.period_start,
+        period_end=settlement.period_end,
         total_shares=int(settlement.total_shares or 0),
         total_work=Decimal(str(settlement.total_work or 0)),
         pool_reward_btc=Decimal(str(settlement.pool_reward_btc or 0)),
@@ -135,14 +233,25 @@ def run_settlement(
     interval_minutes: int | None = None,
     payout_decimals: int | None = None,
     reward_fetcher=fetch_pool_reward,
+    defer_on_zero_reward: bool = False,
+    use_work_accrual: bool = False,
 ) -> SettlementResult:
     """Run one settlement cycle and persist settlement + user payouts."""
     settings = load_settings()
     interval = interval_minutes or settings.payout_interval_minutes
     decimals = payout_decimals or settings.payout_decimals
 
+    latest_settlement = session.execute(
+        select(Settlement).order_by(Settlement.period_end.desc(), Settlement.id.desc()).limit(1)
+    ).scalar_one_or_none()
+
     period_end = now
-    period_start = now - timedelta(minutes=interval)
+    if latest_settlement is None:
+        period_start = now - timedelta(minutes=interval)
+    else:
+        if period_end <= latest_settlement.period_end:
+            return _result_from_existing_settlement(session, latest_settlement)
+        period_start = latest_settlement.period_end
 
     existing_settlement = session.execute(
         select(Settlement).where(
@@ -180,6 +289,8 @@ def run_settlement(
             settlement_id=settlement.id,
             status=settlement.status,
             user_count=0,
+            period_start=period_start,
+            period_end=period_end,
             total_shares=0,
             total_work=ZERO,
             pool_reward_btc=ZERO,
@@ -194,12 +305,36 @@ def run_settlement(
     settlement.total_shares = total_shares
     settlement.total_work = _q(total_work, decimals)
 
+    # --- Deferred branch: no reward this interval ---
+    if defer_on_zero_reward and pool_reward <= ZERO:
+        if use_work_accrual:
+            _add_work_to_accrual(session, user_contributions, now, decimals)
+        settlement.status = "deferred"
+        session.commit()
+        carry = _get_or_create_carry(session)
+        return SettlementResult(
+            settlement_id=settlement.id,
+            status="deferred",
+            user_count=0,
+            period_start=period_start,
+            period_end=period_end,
+            total_shares=total_shares,
+            total_work=_q(total_work, decimals),
+            pool_reward_btc=ZERO,
+            carry_btc=_q(Decimal(str(carry.carry_btc or 0)), decimals),
+        )
+
+    # --- Rewarded branch: merge accrued work into allocation basis ---
+    if use_work_accrual:
+        user_contributions = _apply_accrual_to_contributions(session, user_contributions)
+
     carry = _get_or_create_carry(session)
     previous_carry = _q(Decimal(str(carry.carry_btc or 0)), decimals)
     distributable = _q(pool_reward + previous_carry, decimals)
 
     allocated_sum = ZERO
     user_count = 0
+    settled_usernames: list[str] = []
 
     allocation_rows = _build_allocation_rows(user_contributions, distributable, decimals)
     for row in allocation_rows:
@@ -221,6 +356,10 @@ def run_settlement(
         session.add(payout)
         allocated_sum += payout_amount
         user_count += 1
+        settled_usernames.append(username)
+
+    if use_work_accrual and settled_usernames:
+        _clear_accrual_for_users(session, settled_usernames, now)
 
     carry.carry_btc = _q(distributable - allocated_sum, decimals)
     settlement.status = "completed"
@@ -230,6 +369,8 @@ def run_settlement(
         settlement_id=settlement.id,
         status=settlement.status,
         user_count=user_count,
+        period_start=period_start,
+        period_end=period_end,
         total_shares=total_shares,
         total_work=_q(total_work, decimals),
         pool_reward_btc=pool_reward,

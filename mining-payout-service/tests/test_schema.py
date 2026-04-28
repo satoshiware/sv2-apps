@@ -23,7 +23,17 @@ def test_schema_tables_created(tmp_path: Path) -> None:
         "payout_events",
         "carry_state",
         "block_counter_state",
+        "snapshot_block",
+        "work_accrual_bucket",
     }
+
+    indexes = inspect(engine).get_indexes("snapshot_block")
+    unique_index_columns = {
+        tuple(item.get("column_names", []))
+        for item in indexes
+        if bool(item.get("unique", False))
+    }
+    assert ("blockhash",) in unique_index_columns
 
 
 def test_init_db_migrates_existing_sqlite_schema(tmp_path: Path) -> None:
@@ -56,3 +66,5 @@ def test_init_db_migrates_existing_sqlite_schema(tmp_path: Path) -> None:
     assert {"total_shares", "total_work"}.issubset(settlement_columns)
     assert {"contribution_value", "payout_fraction"}.issubset(user_payout_columns)
     assert "block_counter_state" in set(inspector.get_table_names())
+    assert "snapshot_block" in set(inspector.get_table_names())
+    assert "work_accrual_bucket" in set(inspector.get_table_names())
