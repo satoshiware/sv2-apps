@@ -70,6 +70,42 @@ def test_parse_reward_sats_by_hash_rejects_unknown_shape() -> None:
         parse_reward_sats_by_hash({"tip_height": 123})
 
 
+def test_parse_reward_sats_by_hash_exact_live_blocks_payload() -> None:
+    payload = {
+        "tip_height": 843205,
+        "tip_hash": "00000000000000fb62f0ecfbefc8d6d1667486992fdceb42650fae649835c369",
+        "chain": "main",
+        "maturity_confirmations": 100,
+        "owned_only": False,
+        "lookup_mode": "blockhashes",
+        "requested_blockhash_count": 1,
+        "resolved_blockhash_count": 1,
+        "unresolved_blockhashes": [],
+        "time_filter": {
+            "start_time": None,
+            "end_time": None,
+            "time_field": "mediantime",
+            "interval_rule": "start_time <= selected_time < end_time",
+        },
+        "blocks": [
+            {
+                "height": 842521,
+                "blockhash": "000000000000014b774d5ff29803def01bf3222e479436bfa2cd735181530446",
+                "confirmations": 685,
+                "mediantime": 1777403101,
+                "is_mature": True,
+                "coinbase_total_sats": 187500000,
+            }
+        ],
+    }
+
+    result = parse_reward_sats_by_hash(payload)
+
+    assert result == {
+        "000000000000014b774d5ff29803def01bf3222e479436bfa2cd735181530446": 187500000
+    }
+
+
 def test_phase0_new_settings_defaults(monkeypatch) -> None:
     monkeypatch.delenv("ENABLE_BLOCK_EVENT_REWARDS", raising=False)
     monkeypatch.delenv("MATURITY_WINDOW_MINUTES", raising=False)

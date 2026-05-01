@@ -31,8 +31,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 if (PROJECT_ROOT / ".env").exists():
     load_dotenv(PROJECT_ROOT / ".env")
-else:
-    load_dotenv(PROJECT_ROOT / ".env.example")
 
 from app.db import make_engine, make_session_factory, Base
 from app.delta import compute_user_contribution_deltas

@@ -286,3 +286,49 @@ def test_upsert_snapshot_blocks_skips_null_blockhash(session) -> None:
     )
     assert created == 0
     assert session.query(SnapshotBlock).count() == 0
+
+
+def test_upsert_snapshot_blocks_uses_nearest_candidate_blockhash(session) -> None:
+    created = upsert_snapshot_blocks(
+        session,
+        [
+            {
+                "detected_time": 1777572622,
+                "channel_id": 4,
+                "worker_identity": "baveet.worker3",
+                "blockhash": None,
+                "blockhash_status": "unresolved",
+                "correlation_status": "counter_delta_only",
+                "nearest_candidate_blockhash": "000000000000011507e44e123a627c814d420cf4a144aadfa0fe51509b9c44b7",
+            }
+        ],
+    )
+
+    assert created == 1
+    row = session.query(SnapshotBlock).one()
+    assert row.channel_id == 4
+    assert row.worker_identity == "baveet.worker3"
+    assert row.blockhash == "000000000000011507e44e123a627c814d420cf4a144aadfa0fe51509b9c44b7"
+
+
+def test_upsert_snapshot_blocks_uses_candidate_blocks_list_when_nearest_missing(session) -> None:
+    created = upsert_snapshot_blocks(
+        session,
+        [
+            {
+                "detected_time": 1777572622,
+                "channel_id": 4,
+                "worker_identity": "baveet.worker3",
+                "blockhash": None,
+                "candidate_blocks": [
+                    {
+                        "blockhash": "000000000000011507e44e123a627c814d420cf4a144aadfa0fe51509b9c44b7"
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert created == 1
+    row = session.query(SnapshotBlock).one()
+    assert row.blockhash == "000000000000011507e44e123a627c814d420cf4a144aadfa0fe51509b9c44b7"

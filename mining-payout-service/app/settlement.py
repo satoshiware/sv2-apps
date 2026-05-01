@@ -235,8 +235,16 @@ def run_settlement(
     reward_fetcher=fetch_pool_reward,
     defer_on_zero_reward: bool = False,
     use_work_accrual: bool = False,
+    work_window_start: datetime | None = None,
+    work_window_end: datetime | None = None,
 ) -> SettlementResult:
-    """Run one settlement cycle and persist settlement + user payouts."""
+    """Run one settlement cycle and persist settlement + user payouts.
+
+    work_window_start / work_window_end — when provided (e.g. the matured block
+    window), use these bounds for computing share/work contribution deltas instead
+    of the settlement period bounds.  This keeps contribution attribution aligned
+    with where the rewarded blocks were actually found.
+    """
     settings = load_settings()
     interval = interval_minutes or settings.payout_interval_minutes
     decimals = payout_decimals or settings.payout_decimals
@@ -252,6 +260,11 @@ def run_settlement(
         if period_end <= latest_settlement.period_end:
             return _result_from_existing_settlement(session, latest_settlement)
         period_start = latest_settlement.period_end
+        # Cap the settlement window to at most interval_minutes to prevent
+        # scheduler jitter from accumulating a larger-than-T contribution window.
+        capped_start = period_end - timedelta(minutes=interval)
+        if period_start < capped_start:
+            period_start = capped_start
 
     existing_settlement = session.execute(
         select(Settlement).where(
@@ -300,7 +313,9 @@ def run_settlement(
     pool_reward = _q(pool_reward, decimals)
     settlement.pool_reward_btc = pool_reward
 
-    user_contributions = compute_user_contribution_deltas(session, period_start, period_end)
+    contrib_start = work_window_start if work_window_start is not None else period_start
+    contrib_end = work_window_end if work_window_end is not None else period_end
+    user_contributions = compute_user_contribution_deltas(session, contrib_start, contrib_end)
     total_shares, total_work = _summarize_contributions(user_contributions)
     settlement.total_shares = total_shares
     settlement.total_work = _q(total_work, decimals)

@@ -28,12 +28,27 @@ def test_schema_tables_created(tmp_path: Path) -> None:
     }
 
     indexes = inspect(engine).get_indexes("snapshot_block")
+    indexed_columns = {
+        tuple(item.get("column_names", []))
+        for item in indexes
+    }
     unique_index_columns = {
         tuple(item.get("column_names", []))
         for item in indexes
         if bool(item.get("unique", False))
     }
     assert ("blockhash",) in unique_index_columns
+    assert ("found_at",) in indexed_columns
+    assert ("settlement_id",) in indexed_columns
+    assert ("reward_fetched_at",) in indexed_columns
+
+    accrual_indexes = inspect(engine).get_indexes("work_accrual_bucket")
+    accrual_unique_columns = {
+        tuple(item.get("column_names", []))
+        for item in accrual_indexes
+        if bool(item.get("unique", False))
+    }
+    assert ("user_id",) in accrual_unique_columns
 
 
 def test_init_db_migrates_existing_sqlite_schema(tmp_path: Path) -> None:

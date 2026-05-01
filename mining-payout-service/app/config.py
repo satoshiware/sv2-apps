@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if (PROJECT_ROOT / ".env").exists():
     load_dotenv(PROJECT_ROOT / ".env", override=True)
-else:
-    load_dotenv(PROJECT_ROOT / ".env.example", override=True)
 
 DEFAULT_DB_PATH = str(PROJECT_ROOT / "payouts.db")
 DEFAULT_AUDIT_LOG_PATH = str(PROJECT_ROOT / "logs" / "payout_audit.jsonl")
@@ -54,6 +52,8 @@ class Settings:
     translator_blocks_found_url: str = ""
     translator_blocks_found_timeout_seconds: int = 10
     translator_blocks_found_limit: int = 100
+    translator_blocks_found_candidate_window_seconds: int = 30
+    translator_blocks_found_candidate_limit: int = 5
     translator_metrics_url: str = "http://127.0.0.1:9092/metrics"
     translator_channels_url: str = ""
     translator_downstreams_url: str = ""
@@ -103,6 +103,12 @@ def load_settings() -> Settings:
             os.getenv("TRANSLATOR_BLOCKS_FOUND_TIMEOUT_SECONDS", "10")
         ),
         translator_blocks_found_limit=int(os.getenv("TRANSLATOR_BLOCKS_FOUND_LIMIT", "100")),
+        translator_blocks_found_candidate_window_seconds=int(
+            os.getenv("TRANSLATOR_BLOCKS_FOUND_CANDIDATE_WINDOW_SECONDS", "30")
+        ),
+        translator_blocks_found_candidate_limit=int(
+            os.getenv("TRANSLATOR_BLOCKS_FOUND_CANDIDATE_LIMIT", "5")
+        ),
         translator_metrics_url=os.getenv("TRANSLATOR_METRICS_URL", "http://127.0.0.1:9092/metrics"),
         translator_channels_url=os.getenv("TRANSLATOR_CHANNELS_URL", ""),
         translator_downstreams_url=os.getenv("TRANSLATOR_DOWNSTREAMS_URL", ""),

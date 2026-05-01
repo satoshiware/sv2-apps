@@ -139,6 +139,7 @@ def test_run_settlement_marks_blocked_on_pool_timeout(session) -> None:
     assert session.query(UserPayout).count() == 0
 
 
+@pytest.mark.smoke
 def test_run_settlement_is_idempotent_for_same_window(session) -> None:
     now = datetime(2026, 1, 1, 3, 0, 0)
     start = now - timedelta(minutes=10)
@@ -269,6 +270,7 @@ def _reward_btc(btc_str: str):
 
 
 # Golden test A: one matured reward, payout completes, normal status
+@pytest.mark.smoke
 def test_golden_a_rewarded_interval_completes_normally(session) -> None:
     now = datetime(2026, 1, 1, 0, 10, 0)
     start = now - timedelta(minutes=10)
@@ -308,6 +310,7 @@ def test_golden_a_rewarded_interval_completes_normally(session) -> None:
 
 
 # Golden test B: no matured blocks, reward=0, settlement deferred, accrual updated
+@pytest.mark.smoke
 def test_golden_b_zero_reward_defers_and_accrues(session) -> None:
     now = datetime(2026, 1, 1, 0, 10, 0)
     start = now - timedelta(minutes=10)
@@ -340,6 +343,7 @@ def test_golden_b_zero_reward_defers_and_accrues(session) -> None:
 
 
 # Golden test C: first interval deferred (accrued), next interval rewarded uses carry-forward
+@pytest.mark.smoke
 def test_golden_c_carry_forward_consumed_on_rewarded_interval(session) -> None:
     now1 = datetime(2026, 1, 1, 0, 10, 0)
     now2 = now1 + timedelta(minutes=10)
@@ -560,3 +564,100 @@ def test_deferred_settlement_idempotent_does_not_double_accrue(session) -> None:
     alice = session.query(User).filter_by(username="alice").one()
     bucket = session.query(WorkAccrualBucket).filter_by(user_id=alice.id).one()
     assert Decimal(str(bucket.accumulated_work)) == Decimal("100.00000000")
+
+
+def test_phase_d_payout_fraction_sum_and_reward_reconciliation(session) -> None:
+    now = datetime(2026, 1, 1, 1, 10, 0)
+    start = now - timedelta(minutes=10)
+
+    _add_snapshot(session, "alice.m1", 0, start - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "alice.m1", 10, start + timedelta(minutes=2), work_total=30)
+    _add_snapshot(session, "bob.m1", 0, start - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "bob.m1", 10, start + timedelta(minutes=2), work_total=70)
+    session.commit()
+
+    result = run_settlement(
+        session,
+        now,
+        interval_minutes=10,
+        payout_decimals=8,
+        reward_fetcher=_reward_btc("1.00000000"),
+        defer_on_zero_reward=True,
+        use_work_accrual=True,
+    )
+
+    payouts = (
+        session.query(UserPayout)
+        .filter(UserPayout.settlement_id == result.settlement_id)
+        .order_by(UserPayout.id.asc())
+        .all()
+    )
+    assert len(payouts) == 2
+
+    sum_fraction = sum((Decimal(str(p.payout_fraction)) for p in payouts), Decimal("0"))
+    sum_amount = sum((Decimal(str(p.amount_btc)) for p in payouts), Decimal("0"))
+    carry = session.query(CarryState).filter_by(bucket="default").one()
+    carry_value = Decimal(str(carry.carry_btc))
+
+    assert result.status == "completed"
+    assert sum_fraction == Decimal("1.000000000000")
+    assert sum_amount + carry_value == Decimal("1.00000000")
+
+
+def test_phase_d_accrual_consumption_with_existing_carry_reconciles(session) -> None:
+    now1 = datetime(2026, 1, 1, 2, 10, 0)
+    now2 = now1 + timedelta(minutes=10)
+    start1 = now1 - timedelta(minutes=10)
+
+    _add_snapshot(session, "alice.m1", 0, start1 - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "alice.m1", 10, start1 + timedelta(minutes=2), work_total=120)
+    _add_snapshot(session, "bob.m1", 0, start1 - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "bob.m1", 10, start1 + timedelta(minutes=2), work_total=80)
+
+    _add_snapshot(session, "alice.m1", 15, now2 - timedelta(minutes=1), work_total=150)
+    _add_snapshot(session, "bob.m1", 15, now2 - timedelta(minutes=1), work_total=110)
+    session.commit()
+
+    deferred = run_settlement(
+        session,
+        now1,
+        interval_minutes=10,
+        payout_decimals=8,
+        reward_fetcher=_reward_btc("0.00000000"),
+        defer_on_zero_reward=True,
+        use_work_accrual=True,
+    )
+    assert deferred.status == "deferred"
+
+    carry = session.query(CarryState).filter_by(bucket="default").one()
+    carry.carry_btc = Decimal("0.12345678")
+    session.commit()
+
+    rewarded = run_settlement(
+        session,
+        now2,
+        interval_minutes=10,
+        payout_decimals=8,
+        reward_fetcher=_reward_btc("2.00000000"),
+        defer_on_zero_reward=True,
+        use_work_accrual=True,
+    )
+    assert rewarded.status == "completed"
+
+    payouts = (
+        session.query(UserPayout)
+        .filter(UserPayout.settlement_id == rewarded.settlement_id)
+        .all()
+    )
+    paid_total = sum((Decimal(str(p.amount_btc)) for p in payouts), Decimal("0"))
+    carry_after = Decimal(str(session.query(CarryState).filter_by(bucket="default").one().carry_btc))
+
+    # distributable = reward + previous carry
+    assert paid_total + carry_after == Decimal("2.12345678")
+
+    alice = session.query(User).filter_by(username="alice").one()
+    bob = session.query(User).filter_by(username="bob").one()
+    alice_bucket = session.query(WorkAccrualBucket).filter_by(user_id=alice.id).one()
+    bob_bucket = session.query(WorkAccrualBucket).filter_by(user_id=bob.id).one()
+    assert Decimal(str(alice_bucket.accumulated_work)) == Decimal("0")
+    assert Decimal(str(bob_bucket.accumulated_work)) == Decimal("0")

@@ -170,7 +170,13 @@ def fetch_block_rewards_by_hashes(
     bearer_token: str | None = None,
     timeout_seconds: int | None = None,
 ) -> dict[str, int]:
-    """Fetch per-block rewards (sats) by batch of block hashes."""
+    """Fetch per-block rewards (sats) by blockhash lookup.
+
+    Uses GET /v1/az/blocks/rewards with query params:
+    - owned_only=false
+    - blockhash=<hash>
+    - time_field=mediantime
+    """
     normalized_hashes = [str(item).strip() for item in block_hashes if str(item).strip()]
     if not normalized_hashes:
         return {}
@@ -183,37 +189,44 @@ def fetch_block_rewards_by_hashes(
     resolved_timeout = int(timeout_seconds or settings.block_reward_batch_timeout_seconds or 10)
     resolved_token = (bearer_token or settings.translator_bearer_token or "").strip()
 
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers = {"Accept": "application/json"}
     if resolved_token:
         headers["Authorization"] = f"Bearer {resolved_token}"
 
-    payload = {"block_hashes": normalized_hashes}
-    try:
-        response = requests.post(
-            resolved_url,
-            json=payload,
-            headers=headers,
-            timeout=resolved_timeout,
-        )
-        response.raise_for_status()
-    except requests.Timeout as exc:
-        raise PoolApiTimeout("Block reward API request timed out") from exc
-    except requests.RequestException as exc:
-        raise PoolApiError(f"Block reward API request failed: {exc}") from exc
+    rewards_by_hash: dict[str, int] = {}
+    for blockhash in normalized_hashes:
+        params = {
+            "owned_only": "false",
+            "blockhash": blockhash,
+            "time_field": "mediantime",
+        }
+        try:
+            response = requests.get(
+                resolved_url,
+                params=params,
+                headers=headers,
+                timeout=resolved_timeout,
+            )
+            response.raise_for_status()
+        except requests.Timeout as exc:
+            raise PoolApiTimeout("Block reward API request timed out") from exc
+        except requests.RequestException as exc:
+            raise PoolApiError(f"Block reward API request failed: {exc}") from exc
 
-    try:
-        response_payload = response.json()
-    except ValueError as exc:
-        raise PoolApiError("Block reward API returned non-JSON response") from exc
+        try:
+            response_payload = response.json()
+        except ValueError as exc:
+            raise PoolApiError("Block reward API returned non-JSON response") from exc
 
-    try:
-        parsed_rewards = parse_reward_sats_by_hash(response_payload)
-    except ValueError as exc:
-        raise PoolApiError(str(exc)) from exc
+        try:
+            parsed_rewards = parse_reward_sats_by_hash(response_payload)
+        except ValueError as exc:
+            raise PoolApiError(str(exc)) from exc
 
-    # Keep only requested hashes in the final result.
-    requested = set(normalized_hashes)
-    return {key: value for key, value in parsed_rewards.items() if key in requested}
+        if blockhash in parsed_rewards:
+            rewards_by_hash[blockhash] = parsed_rewards[blockhash]
+
+    return rewards_by_hash
 
 
 def fetch_blocks_found_in_window(
@@ -224,10 +237,13 @@ def fetch_blocks_found_in_window(
     bearer_token: str | None = None,
     timeout_seconds: int | None = None,
     limit: int | None = None,
+    candidate_window_seconds: int | None = None,
+    candidate_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch block-found rows for the shifted matured settlement window.
 
     Calls GET /v1/translator/blocks-found?start_time=<unix>&end_time=<unix>&limit=<n>
+    &include_candidate_blocks=true&candidate_window_seconds=<n>&candidate_limit_per_event=<n>
     """
     settings = load_settings()
     resolved_url = (api_url or settings.translator_blocks_found_url or "").strip()
@@ -237,6 +253,16 @@ def fetch_blocks_found_in_window(
     resolved_timeout = int(timeout_seconds or settings.translator_blocks_found_timeout_seconds or 10)
     resolved_token = (bearer_token or settings.translator_bearer_token or "").strip()
     resolved_limit = int(limit or settings.translator_blocks_found_limit or 100)
+    resolved_candidate_window = int(
+        candidate_window_seconds
+        or settings.translator_blocks_found_candidate_window_seconds
+        or 30
+    )
+    resolved_candidate_limit = int(
+        candidate_limit
+        or settings.translator_blocks_found_candidate_limit
+        or 5
+    )
 
     headers = {"Accept": "application/json"}
     if resolved_token:
@@ -246,6 +272,9 @@ def fetch_blocks_found_in_window(
         "start_time": _to_unix_ts(window_start),
         "end_time": _to_unix_ts(window_end),
         "limit": resolved_limit,
+        "include_candidate_blocks": "true",
+        "candidate_window_seconds": resolved_candidate_window,
+        "candidate_limit_per_event": resolved_candidate_limit,
     }
 
     try:

@@ -6,7 +6,7 @@ import os
 import traceback
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -80,11 +80,47 @@ def _payout_user_breakdown(
                 "username": username,
                 "amount_btc": _to_decimal_str(payout.get("amount_btc") or "0"),
                 "status": payout.get("status"),
+                "payout_fraction": str(payout.get("payout_fraction") or "0"),
+                "contribution_value": _to_decimal_str(payout.get("contribution_value") or "0"),
                 "share_delta": int(contrib["share_delta"]),
                 "work_delta": _to_decimal_str(contrib["work_delta"]),
             }
         )
     return breakdown
+
+
+def _load_block_rows_by_settlement(session: Session, settlement_ids: list[int]) -> dict[int, list[dict[str, object]]]:
+    if not settlement_ids:
+        return {}
+
+    rows = session.execute(
+        select(SnapshotBlock)
+        .where(SnapshotBlock.settlement_id.in_(settlement_ids))
+        .order_by(
+            SnapshotBlock.settlement_id.asc(),
+            SnapshotBlock.found_at.asc(),
+            SnapshotBlock.id.asc(),
+        )
+    ).scalars().all()
+
+    grouped: dict[int, list[dict[str, object]]] = {}
+    for row in rows:
+        settlement_id = int(row.settlement_id or 0)
+        if settlement_id <= 0:
+            continue
+        grouped.setdefault(settlement_id, []).append(
+            {
+                "found_at": row.found_at.isoformat(),
+                "channel_id": int(row.channel_id or 0),
+                "worker_identity": row.worker_identity,
+                "blockhash": row.blockhash,
+                "source": row.source,
+                "reward_sats": int(row.reward_sats or 0),
+                "reward_btc": _to_decimal_str(Decimal(int(row.reward_sats or 0)) / Decimal("100000000")),
+            }
+        )
+
+    return grouped
 
 
 def _compare_with_previous_payout(
@@ -113,6 +149,43 @@ def _compare_with_previous_payout(
                 "work_delta_change": _to_decimal_str(curr_work - prev_work),
             }
         )
+    return rows
+
+
+def _build_interval_ratio_rows(user_contributions: list[dict[str, object]]) -> list[dict[str, object]]:
+    total_share_delta = sum(_to_int(row.get("share_delta")) for row in user_contributions)
+    total_work_delta = sum(Decimal(str(row.get("work_delta") or "0")) for row in user_contributions)
+
+    rows: list[dict[str, object]] = []
+    for row in user_contributions:
+        username = str(row.get("username") or "")
+        if not username:
+            continue
+        share_delta = _to_int(row.get("share_delta"))
+        work_delta = Decimal(str(row.get("work_delta") or "0"))
+        share_ratio = (
+            Decimal(share_delta) / Decimal(total_share_delta)
+            if total_share_delta > 0
+            else Decimal("0")
+        )
+        work_ratio = (
+            work_delta / total_work_delta
+            if total_work_delta > 0
+            else Decimal("0")
+        )
+        rows.append(
+            {
+                "username": username,
+                "share_delta": share_delta,
+                "work_delta": _to_decimal_str(work_delta),
+                "share_ratio": f"{share_ratio:.8f}",
+                "work_ratio": f"{work_ratio:.8f}",
+                "share_ratio_percent": f"{(share_ratio * Decimal('100')):.4f}",
+                "work_ratio_percent": f"{(work_ratio * Decimal('100')):.4f}",
+            }
+        )
+
+    rows.sort(key=lambda item: str(item.get("username") or ""))
     return rows
 
 
@@ -405,6 +478,14 @@ def audit_settlements(limit: int = 120) -> dict:
 
     attempts.sort(key=lambda row: str(row.get("attempted_at") or ""))
 
+    settlement_ids = [
+        _to_int((entry.get("settlement") or {}).get("settlement_id"))
+        for entry in attempts
+        if _to_int((entry.get("settlement") or {}).get("settlement_id")) > 0
+    ]
+    with _new_session() as session:
+        blocks_by_settlement = _load_block_rows_by_settlement(session, settlement_ids)
+
     normalized: list[dict[str, object]] = []
     previous_payout_settlement_id: int | None = None
     previous_payout_contributions: list[dict[str, object]] = []
@@ -416,10 +497,16 @@ def audit_settlements(limit: int = 120) -> dict:
         block_reward = attempt.get("block_reward", {})
         user_contributions = attempt.get("user_contributions", [])
         snapshot_alignment = attempt.get("snapshot_alignment", {})
+        snapshot_total_shares = _to_int(snapshot_alignment.get("total_share_delta"))
+        snapshot_total_work = _to_decimal_str(snapshot_alignment.get("total_work_delta") or "0")
+        interval_ratio_rows = _build_interval_ratio_rows(user_contributions)
+        contribution_window_start = attempt.get("contribution_window_start") or attempt.get("period_start")
+        contribution_window_end = attempt.get("contribution_window_end") or attempt.get("period_end")
 
         payout_count = len(payout_rows)
         settlement_id = settlement.get("settlement_id")
         payout_user_breakdown = _payout_user_breakdown(payout_rows, user_contributions)
+        block_rows = blocks_by_settlement.get(_to_int(settlement_id), [])
 
         previous_payout_comparison: list[dict[str, object]] = []
         if payout_count > 0:
@@ -434,6 +521,8 @@ def audit_settlements(limit: int = 120) -> dict:
                 "attempted_at": attempt.get("attempted_at"),
                 "period_start": attempt.get("period_start"),
                 "period_end": attempt.get("period_end"),
+                "contribution_window_start": contribution_window_start,
+                "contribution_window_end": contribution_window_end,
                 "settlement_id": settlement_id,
                 "status": settlement.get("status"),
                 "reward_mode": settlement.get("reward_mode"),
@@ -441,13 +530,18 @@ def audit_settlements(limit: int = 120) -> dict:
                 "carry_btc": settlement.get("carry_btc"),
                 "total_shares": settlement.get("total_shares", 0),
                 "total_work": settlement.get("total_work"),
+                "snapshot_total_shares": snapshot_total_shares,
+                "snapshot_total_work": snapshot_total_work,
                 "user_count": len(payout_rows),
                 "payout_count": payout_count,
                 "payout_total_btc": _to_decimal_str(_sum_payout_amount(payout_rows)),
                 "unrewarded_user_count": checks.get("unrewarded_user_count", 0),
                 "interval_blocks": int(block_reward.get("interval_blocks", 0) or 0),
                 "computed_reward_btc": block_reward.get("computed_reward_btc", "0.00000000"),
+                "settlement_reward_btc": block_reward.get("settlement_reward_btc", settlement.get("pool_reward_btc")),
+                "block_rows": block_rows,
                 "payout_user_breakdown": payout_user_breakdown,
+                "interval_ratio_rows": interval_ratio_rows,
                 "work_delta_explanation": _build_work_delta_explanation(snapshot_alignment),
                 "last_payout_settlement_id": previous_payout_settlement_id,
                 "last_payout_contributions": previous_payout_contributions,
@@ -555,6 +649,7 @@ def audit_dashboard() -> HTMLResponse:
             display: grid;
             grid-template-columns: 390px 1fr;
             gap: 12px;
+            margin-bottom: 12px;
         }
         .panel {
             background: var(--panel);
@@ -636,6 +731,35 @@ def audit_dashboard() -> HTMLResponse:
             padding: 10px;
         }
         .small { font-size: 12px; color: var(--muted); }
+        .events {
+            padding: 10px 12px;
+            max-height: 38vh;
+            overflow: auto;
+            display: grid;
+            gap: 8px;
+        }
+        .event {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: #fff;
+            padding: 10px;
+        }
+        .event-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+            align-items: center;
+        }
+        .event-type {
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 12px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 2px 8px;
+            background: #f6efe2;
+            color: #4f391f;
+        }
         @keyframes rise {
             from { transform: translateY(6px); opacity: 0; }
             to { transform: translateY(0); opacity: 1; }
@@ -645,6 +769,7 @@ def audit_dashboard() -> HTMLResponse:
             .layout { grid-template-columns: 1fr; }
             .panel { min-height: auto; }
             .list, .detail { max-height: 45vh; }
+            .events { max-height: 45vh; }
         }
     </style>
 </head>
@@ -658,6 +783,10 @@ def audit_dashboard() -> HTMLResponse:
             <label class=\"muted\" style=\"display:flex;align-items:center;gap:8px;\">
                 <input type=\"checkbox\" id=\"rewardOnly\" />
                 Reward/Payout only
+            </label>
+            <label class=\"muted\" style=\"display:flex;align-items:center;gap:8px;\">
+                <input type=\"checkbox\" id=\"autoRefresh\" />
+                Auto Refresh (10s)
             </label>
             <button class=\"btn\" id=\"refreshBtn\">Refresh</button>
         </div>
@@ -674,10 +803,15 @@ def audit_dashboard() -> HTMLResponse:
                 <div class=\"detail\" id=\"detail\">Loading...</div>
             </section>
         </div>
+
+        <section class=\"panel\">
+            <h2>Scheduler & System Events</h2>
+            <div class=\"events\" id=\"events\">Loading...</div>
+        </section>
     </div>
 
     <script>
-        const state = { data: null, selected: 0 };
+        const state = { data: null, selected: 0, autoRefreshTimer: null };
 
         function fmtNum(value) {
             if (value === null || value === undefined) return '-';
@@ -778,32 +912,83 @@ def audit_dashboard() -> HTMLResponse:
                         const workDeltaExplanation = row.work_delta_explanation || {};
                         const workPerUser = workDeltaExplanation.per_user || [];
                         const workPerIdentity = workDeltaExplanation.per_identity || [];
+            const intervalRatioRows = row.interval_ratio_rows || [];
             const payoutRows = raw.payout_rows || [];
             const unrewarded = (raw.checks && raw.checks.unrewarded_users) || [];
             const channels = (raw.block_reward && raw.block_reward.channels) || [];
             const userBreakdown = row.payout_user_breakdown || [];
             const compareWithLast = row.payout_vs_last_payout || [];
+            const blockRows = row.block_rows || [];
+            const blockReward = raw.block_reward || {};
+            const snapshotAlignment = raw.snapshot_alignment || {};
+            const snapshotRows = snapshotAlignment.miners || [];
+            const latestSnapshotState = snapshotAlignment.latest_snapshot_state || [];
+            const coverage = snapshotAlignment.coverage || {};
+            const maturedStart = blockReward.matured_window_start ? fmtMst(blockReward.matured_window_start) : null;
+            const maturedEnd = blockReward.matured_window_end ? fmtMst(blockReward.matured_window_end) : null;
+            const maturedWindowStr = maturedStart && maturedEnd ? `${maturedStart} → ${maturedEnd}` : '—';
+            const contributionWindowStr = fmtPeriod(row.contribution_window_start, row.contribution_window_end);
+            const snapshotWindowShares = fmtNum(row.snapshot_total_shares || 0);
+            const snapshotWindowWork = row.snapshot_total_work || '0.00000000';
+            const payoutRatios = userBreakdown.map((entry) => ({
+                username: entry.username,
+                payout_fraction: entry.payout_fraction || '0',
+                contribution_value: entry.contribution_value || '0.00000000',
+                share_delta: entry.share_delta || 0,
+                work_delta: entry.work_delta || '0.00000000',
+                amount_btc: entry.amount_btc || '0.00000000',
+                status: entry.status || '-',
+            }));
             panel.innerHTML = `
-                                <div class="box"><div class="small">Window Shares / Window Work</div><div>${fmtNum(row.total_shares)} / ${row.total_work || '0.00000000'}</div></div>
+                <div class="detail-grid">
+                    <div class="box"><div class="small">Window Shares / Window Work (From Snapshots)</div><div>${snapshotWindowShares} / ${snapshotWindowWork}</div></div>
                     <div class=\"box\"><div class=\"small\">Attempt</div><div>${row.attempt_id || '-'}</div></div>
-                    <div class=\"box\"><div class=\"small\">Period (MST)</div><div>${fmtPeriod(row.period_start, row.period_end)}</div></div>
-                            <div class="box" style="margin-bottom:10px;">
-                                <div class="small">How Work Delta Is Calculated</div>
-                                <pre>${JSON.stringify({
-                                    source_metric: workDeltaExplanation.source_metric || 'accepted_work_total',
-                                    description: workDeltaExplanation.description || 'current accepted_work_total - baseline accepted_work_total, summed by user',
-                                    reset_rule: workDeltaExplanation.reset_rule || 'negative steps are treated as counter resets and contribute 0',
-                                    per_user: workPerUser,
-                                }, null, 2)}</pre>
-                            </div>
-                            <div class="box" style="margin-bottom:10px;">
-                                <div class="small">accepted_work_total By Identity In This Window</div>
-                                <pre>${JSON.stringify(workPerIdentity, null, 2)}</pre>
-                            </div>
+                    <div class=\"box\"><div class=\"small\">Settlement Period (MST)</div><div>${fmtPeriod(row.period_start, row.period_end)}</div></div>
+                    <div class=\"box\"><div class=\"small\">Contribution Window (MST)</div><div>${contributionWindowStr}</div></div>
+                    <div class=\"box\"><div class=\"small\">Matured Reward Window (MST)</div><div>${maturedWindowStr}</div></div>
                     <div class=\"box\"><div class=\"small\">Pool Reward BTC</div><div>${fmtBtc(row.pool_reward_btc)}</div></div>
+                    <div class=\"box\"><div class=\"small\">Computed Reward BTC</div><div>${fmtBtc(row.computed_reward_btc)}</div></div>
+                    <div class=\"box\"><div class=\"small\">Settlement Reward BTC</div><div>${fmtBtc(row.settlement_reward_btc)}</div></div>
                     <div class=\"box\"><div class=\"small\">Payout Total BTC</div><div>${fmtBtc(row.payout_total_btc)}</div></div>
-                    <div class=\"box\"><div class=\"small\">Total Shares / Work</div><div>${fmtNum(row.total_shares)} / ${row.total_work || '0.00000000'}</div></div>
                     <div class=\"box\"><div class=\"small\">Blocks Found This Cycle</div><div>${fmtNum(row.interval_blocks)}</div></div>
+                    <div class=\"box\"><div class=\"small\">Linked Matured Blocks</div><div>${fmtNum(blockRows.length)}</div></div>
+                    <div class=\"box\"><div class=\"small\">Snapshot Coverage</div><div>${fmtNum(coverage.snapshots_in_window || 0)} in-window / ${fmtNum(coverage.tracked_miners_total || 0)} miners</div></div>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">How Work Delta Is Calculated</div>
+                    <pre>${JSON.stringify({
+                        contribution_window_start: row.contribution_window_start || null,
+                        contribution_window_end: row.contribution_window_end || null,
+                        source_metric: workDeltaExplanation.source_metric || 'accepted_work_total',
+                        description: workDeltaExplanation.description || 'current accepted_work_total - baseline accepted_work_total, summed by user',
+                        reset_rule: workDeltaExplanation.reset_rule || 'negative steps are treated as counter resets and contribute 0',
+                        coverage,
+                        per_user: workPerUser,
+                    }, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">Snapshot Rows Used For Delta (Baseline -> Current)</div>
+                    <pre>${JSON.stringify(snapshotRows, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">Latest Snapshot State By Identity</div>
+                    <pre>${JSON.stringify(latestSnapshotState, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">accepted_work_total By Identity In Contribution Window</div>
+                    <pre>${JSON.stringify(workPerIdentity, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">Payout Ratio By User</div>
+                    <pre>${JSON.stringify(payoutRatios, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">Interval Ratio From Snapshot Deltas (user_delta / total_delta)</div>
+                    <pre>${JSON.stringify(intervalRatioRows, null, 2)}</pre>
+                </div>
+                <div class="box" style="margin-bottom:10px;">
+                    <div class="small">Matured Blocks And Rewards</div>
+                    <pre>${JSON.stringify(blockRows, null, 2)}</pre>
                 </div>
                 <div class=\"box\" style=\"margin-bottom:10px;\">
                     <div class=\"small\">Payout Split By User (this settlement)</div>
@@ -828,12 +1013,56 @@ def audit_dashboard() -> HTMLResponse:
             `;
         }
 
+        function renderEvents() {
+            const panel = document.getElementById('events');
+            const events = (state.data && state.data.scheduler_events) || [];
+            if (!events.length) {
+                panel.innerHTML = '<div class=\"muted\">No scheduler/system events found yet in the audit log.</div>';
+                return;
+            }
+
+            const sorted = [...events].sort((a, b) => {
+                return String(b.timestamp || '').localeCompare(String(a.timestamp || ''));
+            });
+
+            panel.innerHTML = sorted.map((event) => {
+                const eventType = event.event_type || 'unknown_event';
+                const eventTime = fmtMst(event.timestamp);
+                const payload = event.payload || {};
+                return `
+                    <div class=\"event\">
+                        <div class=\"event-top\">
+                            <span class=\"event-type\">${eventType}</span>
+                            <span class=\"small\">${eventTime}</span>
+                        </div>
+                        <pre>${JSON.stringify(payload, null, 2)}</pre>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateAutoRefresh() {
+            const enabled = Boolean(document.getElementById('autoRefresh').checked);
+            if (state.autoRefreshTimer) {
+                clearInterval(state.autoRefreshTimer);
+                state.autoRefreshTimer = null;
+            }
+            if (enabled) {
+                state.autoRefreshTimer = setInterval(() => {
+                    loadData();
+                }, 10000);
+            }
+        }
+
         async function loadData() {
             const detail = document.getElementById('detail');
+            const eventsPanel = document.getElementById('events');
             detail.textContent = 'Loading latest settlements...';
+            eventsPanel.textContent = 'Loading scheduler/system events...';
             const res = await fetch('/audit/settlements?limit=200');
             if (!res.ok) {
                 detail.textContent = 'Failed to load settlements feed.';
+                eventsPanel.textContent = 'Failed to load scheduler/system events.';
                 return;
             }
             state.data = await res.json();
@@ -841,14 +1070,17 @@ def audit_dashboard() -> HTMLResponse:
             renderKpis();
             renderList();
             renderDetail();
+            renderEvents();
         }
 
         document.getElementById('refreshBtn').addEventListener('click', loadData);
+        document.getElementById('autoRefresh').addEventListener('change', updateAutoRefresh);
         document.getElementById('rewardOnly').addEventListener('change', () => {
             state.selected = 0;
             renderList();
             renderDetail();
         });
+        updateAutoRefresh();
         loadData();
     </script>
 </body>
@@ -954,7 +1186,11 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
 
         should_settle = force_settlement
         if not should_settle:
-            should_settle = next_settlement_due_at is None or attempt_time >= next_settlement_due_at
+            due_time_tolerance = timedelta(seconds=1)
+            should_settle = (
+                next_settlement_due_at is None
+                or attempt_time + due_time_tolerance >= next_settlement_due_at
+            )
 
         if not should_settle:
             sender_stats = process_payout_events(session, dry_run=settings.dry_run)
@@ -1019,8 +1255,40 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                 .order_by(SnapshotBlock.found_at.asc(), SnapshotBlock.id.asc())
             ).scalars().all()
 
+            # Retry previously seen block hashes that still have no resolved reward,
+            # even if their found_at is outside the current matured window.
+            retry_rows = session.execute(
+                select(SnapshotBlock)
+                .where(
+                    SnapshotBlock.settlement_id.is_not(None),
+                    SnapshotBlock.found_at < matured_end,
+                    or_(
+                        SnapshotBlock.reward_sats.is_(None),
+                        SnapshotBlock.reward_sats <= 0,
+                    ),
+                )
+                .order_by(SnapshotBlock.found_at.asc(), SnapshotBlock.id.asc())
+                .limit(1000)
+            ).scalars().all()
+
+            rows_by_hash: dict[str, SnapshotBlock] = {}
+            for row in matured_rows:
+                rows_by_hash[row.blockhash] = row
+            for row in retry_rows:
+                if row.blockhash not in rows_by_hash:
+                    rows_by_hash[row.blockhash] = row
+
+            selected_rows = list(rows_by_hash.values())
+            current_matured_hashes = [row.blockhash for row in matured_rows if row.blockhash]
+            current_matured_hash_set = set(current_matured_hashes)
+            retry_hashes = [
+                row.blockhash
+                for row in selected_rows
+                if row.blockhash and row.blockhash not in current_matured_hash_set
+            ]
+
             selected_snapshot_block_ids = [int(row.id) for row in matured_rows]
-            selected_matured_hashes = [row.blockhash for row in matured_rows if row.blockhash]
+            selected_matured_hashes = [row.blockhash for row in selected_rows if row.blockhash]
 
             rewards_sats_by_hash: dict[str, int] = {}
             if selected_matured_hashes:
@@ -1043,11 +1311,16 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                 for blockhash in selected_matured_hashes
                 if blockhash not in rewards_sats_by_hash
             ]
-            reward_entries_complete = not missing_reward_hashes
+            missing_current_matured_hashes = [
+                blockhash
+                for blockhash in current_matured_hashes
+                if blockhash not in rewards_sats_by_hash
+            ]
+            reward_entries_complete = not missing_current_matured_hashes
 
             total_sats = 0
             now_utc_naive = datetime.now(UTC).replace(tzinfo=None)
-            for row in matured_rows:
+            for row in selected_rows:
                 sats = int(rewards_sats_by_hash.get(row.blockhash, 0) or 0)
                 total_sats += sats
                 row.reward_sats = sats
@@ -1063,11 +1336,14 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                 "matured_window_end": matured_end.isoformat(),
                 "fetched_block_count": len(fetched_block_rows),
                 "inserted_block_count": int(inserted_blocks),
-                "matured_hash_count": len(selected_matured_hashes),
+                "matured_hash_count": len([row for row in matured_rows if row.blockhash]),
+                "retry_hash_count": len(selected_matured_hashes),
+                "retry_only_hash_count": len(retry_hashes),
                 "computed_reward_btc": _to_decimal_str(computed_reward),
                 "settlement_reward_btc": _to_decimal_str(settlement_reward),
                 "reward_entries_complete": reward_entries_complete,
                 "missing_reward_hash_count": len(missing_reward_hashes),
+                "missing_current_matured_hash_count": len(missing_current_matured_hashes),
             }
 
             session.flush()
@@ -1081,6 +1357,8 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
         if settings.enable_block_event_rewards:
             settlement_kwargs["defer_on_zero_reward"] = bool(settings.defer_on_zero_matured_reward)
             settlement_kwargs["use_work_accrual"] = True
+            settlement_kwargs["work_window_start"] = matured_start
+            settlement_kwargs["work_window_end"] = matured_end
 
         settlement_result = run_settlement(
             session,
@@ -1120,6 +1398,8 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
             total_work_btc_basis=settlement_result.total_work,
             total_share_delta=settlement_result.total_shares,
             block_reward=block_reward_payload,
+            contribution_window_start=settlement_kwargs.get("work_window_start"),
+            contribution_window_end=settlement_kwargs.get("work_window_end"),
         )
         try:
             write_payout_audit_log(settings.payout_audit_log_path, audit_event)

@@ -273,6 +273,21 @@ def _normalize_snapshot_block_row(
 ) -> dict[str, Any] | None:
     blockhash = str(payload.get("blockhash") or payload.get("block_hash") or "").strip()
     if not blockhash:
+        # Translator may emit unresolved counter-delta events with a best candidate
+        # hash in nearest_candidate_blockhash before blockhash is finalized.
+        blockhash = str(payload.get("nearest_candidate_blockhash") or "").strip()
+
+    if not blockhash:
+        candidate_blocks = payload.get("candidate_blocks")
+        if isinstance(candidate_blocks, list):
+            for candidate in candidate_blocks:
+                if not isinstance(candidate, dict):
+                    continue
+                blockhash = str(candidate.get("blockhash") or "").strip()
+                if blockhash:
+                    break
+
+    if not blockhash:
         return None
 
     found_at_raw = payload.get(

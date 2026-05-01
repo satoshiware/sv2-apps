@@ -143,7 +143,13 @@ def _build_snapshot_alignment(
 
 def _build_payout_rows(session: Session, settlement_id: int) -> list[dict[str, object]]:
     rows = session.execute(
-        select(User.username, UserPayout.amount_btc, UserPayout.status)
+        select(
+            User.username,
+            UserPayout.amount_btc,
+            UserPayout.status,
+            UserPayout.payout_fraction,
+            UserPayout.contribution_value,
+        )
         .join(User, User.id == UserPayout.user_id)
         .where(UserPayout.settlement_id == settlement_id)
         .order_by(User.username.asc())
@@ -153,8 +159,10 @@ def _build_payout_rows(session: Session, settlement_id: int) -> list[dict[str, o
             "username": username,
             "amount_btc": _to_decimal_str(amount_btc),
             "status": status,
+            "payout_fraction": f"{_to_decimal(payout_fraction):.12f}",
+            "contribution_value": _to_decimal_str(contribution_value),
         }
-        for username, amount_btc, status in rows
+        for username, amount_btc, status, payout_fraction, contribution_value in rows
     ]
 
 
@@ -217,10 +225,23 @@ def build_payout_audit_event(
     total_work_btc_basis: Decimal,
     total_share_delta: int,
     block_reward: dict[str, object] | None = None,
+    contribution_window_start: datetime | None = None,
+    contribution_window_end: datetime | None = None,
 ) -> dict[str, object]:
-    snapshot_alignment = _build_snapshot_alignment(session, period_start, period_end)
+    effective_contribution_window_start = contribution_window_start or period_start
+    effective_contribution_window_end = contribution_window_end or period_end
+
+    snapshot_alignment = _build_snapshot_alignment(
+        session,
+        effective_contribution_window_start,
+        effective_contribution_window_end,
+    )
     payout_rows = _build_payout_rows(session, settlement_id)
-    user_contributions = _build_user_contributions(session, period_start, period_end)
+    user_contributions = _build_user_contributions(
+        session,
+        effective_contribution_window_start,
+        effective_contribution_window_end,
+    )
     unrewarded_users = _find_unrewarded_users(user_contributions, payout_rows)
 
     identities_without_username = 0
@@ -236,6 +257,8 @@ def build_payout_audit_event(
         "attempted_at": attempted_at.isoformat(),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
+        "contribution_window_start": effective_contribution_window_start.isoformat(),
+        "contribution_window_end": effective_contribution_window_end.isoformat(),
         "snapshots_created": int(snapshots_created),
         "settlement": {
             "settlement_id": int(settlement_id),
