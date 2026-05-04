@@ -1,7 +1,7 @@
 from decimal import Decimal
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Integer, String, Numeric, ForeignKey, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Numeric, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -119,4 +119,48 @@ class WorkAccrualBucket(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
     accumulated_work: Mapped[Decimal] = mapped_column(Numeric(28, 8), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class WorkEpoch(Base):
+    __tablename__ = "work_epoch"
+    __table_args__ = (
+        UniqueConstraint("window_start", "window_end", name="uq_work_epoch_window"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime, index=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open")
+    accrued_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class WorkEpochUserBasis(Base):
+    __tablename__ = "work_epoch_user_basis"
+    __table_args__ = (
+        UniqueConstraint("epoch_id", "user_id", name="uq_work_epoch_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    epoch_id: Mapped[int] = mapped_column(ForeignKey("work_epoch.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    share_delta: Mapped[int] = mapped_column(Integer, default=0)
+    work_delta: Mapped[Decimal] = mapped_column(Numeric(28, 8), default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class PendingBlockReward(Base):
+    __tablename__ = "pending_block_reward"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    blockhash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    found_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    epoch_id: Mapped[int] = mapped_column(ForeignKey("work_epoch.id"), index=True)
+    reward_sats: Mapped[int] = mapped_column(Integer, nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime, nullable=True, index=True)
+    paid: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    paid_settlement_id: Mapped[int] = mapped_column(ForeignKey("settlements.id"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)

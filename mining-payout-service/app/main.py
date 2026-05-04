@@ -27,13 +27,21 @@ from app.hooks import (
 )
 from app.init_db import init_db
 from app.mapping import parse_identity
-from app.models import BlockCounterState, PayoutEvent, Settlement, SnapshotBlock, User, UserPayout
+from app.models import (
+    BlockCounterState,
+    PendingBlockReward,
+    PayoutEvent,
+    Settlement,
+    SnapshotBlock,
+    User,
+    UserPayout,
+)
 from app.poller import poll_channels_once_with_blocks, poll_metrics_once, upsert_snapshot_blocks
 from app.pool_client import PoolApiError, fetch_block_rewards_by_hashes, fetch_blocks_found_in_window
 from app.reward_contract import compute_matured_window
 from app.scheduler import start_scheduler, stop_scheduler
 from app.sender import process_payout_events
-from app.settlement import run_settlement
+from app.settlement import accrue_work_epoch_once, run_epoch_group_settlement, run_settlement
 
 app = FastAPI(title="Mining Payout Service", version="0.1.0")
 _SERVICE_STARTED_AT: datetime | None = None
@@ -317,7 +325,7 @@ def on_startup() -> None:
         "scheduler_started",
         {
             "interval_seconds": int(max(1, int(settings.scheduler_interval_seconds))),
-            "reward_mode": _normalize_reward_mode(settings.reward_mode),
+            "reward_mode": _normalize_reward_mode(settings),
             "channels_url_configured": bool(settings.translator_channels_url),
             "audit_log_path": settings.payout_audit_log_path,
             "archived_log_path": archived_log,
@@ -382,9 +390,12 @@ def _to_decimal_str(value: object) -> str:
     return f"{Decimal(str(value or 0)):.8f}"
 
 
-def _normalize_reward_mode(value: str) -> str:
-    mode = (value or "").strip().lower()
-    return mode if mode in {"manual", "blocks"} else "blocks"
+def _normalize_reward_mode(settings: object) -> str:
+    if bool(getattr(settings, "enable_block_event_rewards", False)):
+        return "block_events"
+    if bool(getattr(settings, "demo_fixed_reward_mode", False)):
+        return "demo_fixed"
+    return "pool_api"
 
 
 def _compute_interval_blocks_delta(
@@ -1135,8 +1146,8 @@ def run_settlement_cycle() -> dict:
 
 def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
     settings = load_settings()
-    reward_mode = _normalize_reward_mode(settings.reward_mode)
-    block_reward_btc = Decimal(str(settings.block_reward_btc or "1.87500000"))
+    reward_mode = _normalize_reward_mode(settings)
+    demo_block_reward_btc = Decimal(str(settings.block_reward_btc or "1.87500000"))
     attempt_id = str(uuid.uuid4())
 
     with _new_session() as session:
@@ -1159,6 +1170,8 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
         reward_fetcher = None
         selected_snapshot_block_ids: list[int] = []
         selected_matured_hashes: list[str] = []
+        settlement_result = None
+        used_epoch_group_settlement = False
 
         if settings.translator_channels_url:
             snapshots_created, current_blocks_found_by_channel = poll_channels_once_with_blocks(
@@ -1167,15 +1180,15 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                 downstream_url=settings.translator_downstreams_url,
                 bearer_token=settings.translator_bearer_token,
             )
-            if reward_mode == "blocks":
+            if settings.demo_fixed_reward_mode:
                 interval_blocks, block_delta_details = _compute_interval_blocks_delta(
                     session,
                     current_blocks_found_by_channel,
                 )
-                computed_reward = Decimal(interval_blocks) * block_reward_btc
+                computed_reward = Decimal(interval_blocks) * demo_block_reward_btc
                 block_reward_payload = {
-                    "reward_mode": "blocks",
-                    "block_reward_btc": _to_decimal_str(block_reward_btc),
+                    "reward_mode": "demo_fixed",
+                    "block_reward_btc": _to_decimal_str(demo_block_reward_btc),
                     "interval_blocks": int(interval_blocks),
                     "computed_reward_btc": _to_decimal_str(computed_reward),
                     "channels": block_delta_details,
@@ -1209,12 +1222,12 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                     "created_events": sender_stats.created_events,
                 },
             }
-            if settings.translator_channels_url and reward_mode == "blocks":
+            if settings.translator_channels_url and settings.demo_fixed_reward_mode:
                 response["block_reward"] = {
-                    "reward_mode": "blocks",
-                    "block_reward_btc": _to_decimal_str(block_reward_btc),
+                    "reward_mode": "demo_fixed",
+                    "block_reward_btc": _to_decimal_str(demo_block_reward_btc),
                     "interval_blocks": int(interval_blocks),
-                    "computed_reward_btc": _to_decimal_str(Decimal(interval_blocks) * block_reward_btc),
+                    "computed_reward_btc": _to_decimal_str(Decimal(interval_blocks) * demo_block_reward_btc),
                     "channels": block_delta_details,
                 }
             return response
@@ -1260,7 +1273,6 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
             retry_rows = session.execute(
                 select(SnapshotBlock)
                 .where(
-                    SnapshotBlock.settlement_id.is_not(None),
                     SnapshotBlock.found_at < matured_end,
                     or_(
                         SnapshotBlock.reward_sats.is_(None),
@@ -1311,6 +1323,48 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
                 for blockhash in selected_matured_hashes
                 if blockhash not in rewards_sats_by_hash
             ]
+
+            use_epoch_group_settlement = bool(settings.enable_epoch_group_settlement)
+            current_epoch = None
+            blocked_shares = 0
+            blocked_work = Decimal("0")
+            accrued_applied_now = False
+            if use_epoch_group_settlement and matured_rows:
+                current_epoch, blocked_shares, blocked_work, accrued_applied_now = accrue_work_epoch_once(
+                    session,
+                    window_start=matured_start,
+                    window_end=matured_end,
+                    now=attempt_time,
+                    decimals=settings.payout_decimals,
+                )
+
+            now_utc_naive = datetime.now(UTC).replace(tzinfo=None)
+            pending_by_hash: dict[str, PendingBlockReward] = {}
+            if use_epoch_group_settlement and current_epoch is not None:
+                for row in matured_rows:
+                    if not row.blockhash:
+                        continue
+                    pending = session.execute(
+                        select(PendingBlockReward).where(PendingBlockReward.blockhash == row.blockhash)
+                    ).scalar_one_or_none()
+                    if pending is None:
+                        pending = PendingBlockReward(
+                            blockhash=row.blockhash,
+                            found_at=row.found_at,
+                            epoch_id=current_epoch.id,
+                            reward_sats=None,
+                            resolved_at=None,
+                            paid=False,
+                            paid_settlement_id=None,
+                            created_at=now_utc_naive,
+                            updated_at=now_utc_naive,
+                        )
+                        session.add(pending)
+                    elif pending.epoch_id is None:
+                        pending.epoch_id = current_epoch.id
+                        pending.updated_at = now_utc_naive
+                    pending_by_hash[pending.blockhash] = pending
+
             missing_current_matured_hashes = [
                 blockhash
                 for blockhash in current_matured_hashes
@@ -1318,18 +1372,181 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
             ]
             reward_entries_complete = not missing_current_matured_hashes
 
+            # If current matured hashes exist but reward resolution is incomplete,
+            # block this cycle and retry later. This avoids treating
+            # "block exists but reward missing" as a zero-reward deferred window.
+            if current_matured_hashes and missing_current_matured_hashes:
+                resolved_sats = sum(
+                    int(rewards_sats_by_hash.get(blockhash, 0) or 0)
+                    for blockhash in selected_matured_hashes
+                )
+                computed_reward = Decimal(resolved_sats) / Decimal("100000000")
+                block_reward_payload = {
+                    "reward_mode": "block_events",
+                    "matured_window_start": matured_start.isoformat(),
+                    "matured_window_end": matured_end.isoformat(),
+                    "fetched_block_count": len(fetched_block_rows),
+                    "inserted_block_count": int(inserted_blocks),
+                    "matured_hash_count": len([row for row in matured_rows if row.blockhash]),
+                    "retry_hash_count": len(selected_matured_hashes),
+                    "retry_only_hash_count": len(retry_hashes),
+                    "computed_reward_btc": _to_decimal_str(computed_reward),
+                    "settlement_reward_btc": _to_decimal_str(Decimal("0")),
+                    "reward_entries_complete": reward_entries_complete,
+                    "missing_reward_hash_count": len(missing_reward_hashes),
+                    "missing_current_matured_hash_count": len(missing_current_matured_hashes),
+                }
+
+                if not use_epoch_group_settlement:
+                    epoch, blocked_shares, blocked_work, accrued_applied_now = accrue_work_epoch_once(
+                        session,
+                        window_start=matured_start,
+                        window_end=matured_end,
+                        now=attempt_time,
+                        decimals=settings.payout_decimals,
+                    )
+
+                    now_utc_naive = datetime.now(UTC).replace(tzinfo=None)
+                    for row in matured_rows:
+                        if not row.blockhash:
+                            continue
+                        pending = session.execute(
+                            select(PendingBlockReward).where(PendingBlockReward.blockhash == row.blockhash)
+                        ).scalar_one_or_none()
+                        if pending is None:
+                            pending = PendingBlockReward(
+                                blockhash=row.blockhash,
+                                found_at=row.found_at,
+                                epoch_id=epoch.id,
+                                reward_sats=None,
+                                resolved_at=None,
+                                paid=False,
+                                paid_settlement_id=None,
+                                created_at=now_utc_naive,
+                                updated_at=now_utc_naive,
+                            )
+                            session.add(pending)
+                        else:
+                            pending.epoch_id = int(pending.epoch_id or epoch.id)
+                            pending.updated_at = now_utc_naive
+
+                session.flush()
+
+                sender_stats = process_payout_events(session, dry_run=settings.dry_run)
+                blocked_event = {
+                    "attempt_id": attempt_id,
+                    "attempted_at": attempt_time.isoformat(),
+                    "period_start": None,
+                    "period_end": None,
+                    "snapshots_created": snapshots_created,
+                    "settlement": {
+                        "settlement_id": None,
+                        "status": "blocked",
+                        "reward_mode": reward_mode,
+                        "pool_reward_btc": _to_decimal_str(Decimal("0")),
+                        "carry_btc": _to_decimal_str(Decimal("0")),
+                        "total_shares": int(blocked_shares),
+                        "total_work": _to_decimal_str(blocked_work),
+                    },
+                    "block_reward": {
+                        **block_reward_payload,
+                        "blocked_epoch_id": int(current_epoch.id) if current_epoch is not None else None,
+                        "blocked_accrual_applied_now": bool(accrued_applied_now),
+                    },
+                    "sender": {
+                        "attempted": sender_stats.attempted,
+                        "sent": sender_stats.sent,
+                        "failed": sender_stats.failed,
+                        "created_events": sender_stats.created_events,
+                    },
+                }
+                try:
+                    write_payout_audit_log(settings.payout_audit_log_path, blocked_event)
+                except OSError:
+                    _write_scheduler_event(
+                        "audit_log_write_failed",
+                        {
+                            "attempt_id": attempt_id,
+                            "audit_log_path": settings.payout_audit_log_path,
+                        },
+                    )
+                return {
+                    "snapshots_created": snapshots_created,
+                    "settlement_skipped": False,
+                    "settlement": {
+                        "settlement_id": None,
+                        "status": "blocked",
+                        "period_start": None,
+                        "period_end": None,
+                        "user_count": 0,
+                        "total_shares": int(blocked_shares),
+                        "total_work": _to_decimal_str(blocked_work),
+                        "pool_reward_btc": _to_decimal_str(Decimal("0")),
+                        "carry_btc": _to_decimal_str(Decimal("0")),
+                    },
+                    "sender": {
+                        "attempted": sender_stats.attempted,
+                        "sent": sender_stats.sent,
+                        "failed": sender_stats.failed,
+                        "created_events": sender_stats.created_events,
+                    },
+                    "block_reward": {
+                        **block_reward_payload,
+                        "blocked_epoch_id": int(current_epoch.id) if current_epoch is not None else None,
+                        "blocked_accrual_applied_now": bool(accrued_applied_now),
+                    },
+                }
+
             total_sats = 0
-            now_utc_naive = datetime.now(UTC).replace(tzinfo=None)
             for row in selected_rows:
                 sats = int(rewards_sats_by_hash.get(row.blockhash, 0) or 0)
                 total_sats += sats
-                row.reward_sats = sats
-                row.reward_fetched_at = now_utc_naive
-                row.updated_at = now_utc_naive
+                # Only persist reward_sats when we have a positive resolution so that
+                # unresolved hashes keep reward_sats=NULL/0 and remain eligible for
+                # the retry filter in future cycles.
+                if sats > 0:
+                    row.reward_sats = sats
+                    row.reward_fetched_at = now_utc_naive
+                    row.updated_at = now_utc_naive
+                    if use_epoch_group_settlement:
+                        pending = pending_by_hash.get(row.blockhash)
+                        if pending is None and row.blockhash:
+                            pending = session.execute(
+                                select(PendingBlockReward).where(PendingBlockReward.blockhash == row.blockhash)
+                            ).scalar_one_or_none()
+                        if pending is not None:
+                            pending.reward_sats = sats
+                            pending.resolved_at = now_utc_naive
+                            pending.updated_at = now_utc_naive
 
             computed_reward = Decimal(total_sats) / Decimal("100000000")
-            settlement_reward = computed_reward if reward_entries_complete else Decimal("0")
-            reward_fetcher = lambda _start, _end: settlement_reward
+
+            settlement_reward = computed_reward
+            epoch_reward_sats: dict[int, int] = {}
+            if use_epoch_group_settlement:
+                eligible_pending_rows = session.execute(
+                    select(PendingBlockReward)
+                    .where(
+                        PendingBlockReward.paid.is_(False),
+                        PendingBlockReward.reward_sats.is_not(None),
+                        PendingBlockReward.reward_sats > 0,
+                        PendingBlockReward.epoch_id.is_not(None),
+                        PendingBlockReward.found_at < matured_end,
+                    )
+                ).scalars().all()
+                epoch_reward_sats: dict[int, int] = {}
+                for row in eligible_pending_rows:
+                    if row.epoch_id is None:
+                        continue
+                    epoch_reward_sats[int(row.epoch_id)] = int(
+                        epoch_reward_sats.get(int(row.epoch_id), 0)
+                    ) + int(row.reward_sats or 0)
+                settlement_reward = Decimal(sum(epoch_reward_sats.values())) / Decimal("100000000")
+                if not epoch_reward_sats:
+                    reward_fetcher = lambda _start, _end: settlement_reward
+            else:
+                reward_fetcher = lambda _start, _end: settlement_reward
+
             block_reward_payload = {
                 "reward_mode": "block_events",
                 "matured_window_start": matured_start.isoformat(),
@@ -1348,6 +1565,35 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
 
             session.flush()
 
+            if use_epoch_group_settlement and epoch_reward_sats:
+                settlement_result = run_epoch_group_settlement(
+                    session,
+                    attempt_time,
+                    epoch_reward_sats=epoch_reward_sats,
+                    interval_minutes=settings.payout_interval_minutes,
+                    payout_decimals=settings.payout_decimals,
+                )
+                used_epoch_group_settlement = True
+
+                paid_hashes = {
+                    row.blockhash
+                    for row in session.execute(
+                        select(PendingBlockReward).where(
+                            PendingBlockReward.paid_settlement_id == settlement_result.settlement_id
+                        )
+                    ).scalars().all()
+                    if row.blockhash
+                }
+                if paid_hashes:
+                    rows_to_link = session.execute(
+                        select(SnapshotBlock).where(SnapshotBlock.blockhash.in_(list(paid_hashes)))
+                    ).scalars().all()
+                    link_now = datetime.now(UTC).replace(tzinfo=None)
+                    for row in rows_to_link:
+                        row.settlement_id = settlement_result.settlement_id
+                        row.updated_at = link_now
+                    session.flush()
+
         settlement_kwargs = {
             "interval_minutes": settings.payout_interval_minutes,
             "payout_decimals": settings.payout_decimals,
@@ -1356,15 +1602,17 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
             settlement_kwargs["reward_fetcher"] = reward_fetcher
         if settings.enable_block_event_rewards:
             settlement_kwargs["defer_on_zero_reward"] = bool(settings.defer_on_zero_matured_reward)
-            settlement_kwargs["use_work_accrual"] = True
             settlement_kwargs["work_window_start"] = matured_start
             settlement_kwargs["work_window_end"] = matured_end
+            if not used_epoch_group_settlement:
+                settlement_kwargs["use_work_accrual"] = True
 
-        settlement_result = run_settlement(
-            session,
-            attempt_time,
-            **settlement_kwargs,
-        )
+        if settlement_result is None:
+            settlement_result = run_settlement(
+                session,
+                attempt_time,
+                **settlement_kwargs,
+            )
 
         if settings.enable_settlement_replay_hook:
             try:
@@ -1372,7 +1620,10 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
             except Exception:
                 pass
 
-        if selected_snapshot_block_ids:
+        if selected_snapshot_block_ids and (
+            not settings.enable_block_event_rewards
+            or not used_epoch_group_settlement
+        ):
             rows_to_link = session.execute(
                 select(SnapshotBlock).where(SnapshotBlock.id.in_(selected_snapshot_block_ids))
             ).scalars().all()
@@ -1436,12 +1687,12 @@ def _execute_settlement_cycle(*, force_settlement: bool = False) -> dict:
 
     if block_reward_payload is not None:
         response["block_reward"] = block_reward_payload
-    elif settings.translator_channels_url and reward_mode == "blocks":
+    elif settings.translator_channels_url and settings.demo_fixed_reward_mode:
         response["block_reward"] = {
-            "reward_mode": "blocks",
-            "block_reward_btc": _to_decimal_str(block_reward_btc),
+            "reward_mode": "demo_fixed",
+            "block_reward_btc": _to_decimal_str(demo_block_reward_btc),
             "interval_blocks": int(interval_blocks),
-            "computed_reward_btc": _to_decimal_str(Decimal(interval_blocks) * block_reward_btc),
+            "computed_reward_btc": _to_decimal_str(Decimal(interval_blocks) * demo_block_reward_btc),
             "channels": block_delta_details,
         }
 

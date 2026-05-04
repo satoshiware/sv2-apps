@@ -15,9 +15,24 @@ from app.hooks import (
     set_startup_reconciliation_hook,
 )
 from app.main import app
-from app.models import MetricSnapshot, PayoutEvent, Settlement, SnapshotBlock, User, UserPayout, WorkAccrualBucket
+from app.models import (
+    MetricSnapshot,
+    PayoutEvent,
+    PendingBlockReward,
+    Settlement,
+    SnapshotBlock,
+    User,
+    UserPayout,
+    WorkAccrualBucket,
+)
 from app.sender import SenderStats
 from app.settlement import SettlementResult
+
+
+@pytest.fixture(autouse=True)
+def _default_disable_epoch_group_settlement(monkeypatch) -> None:
+    # Keep legacy expectations stable unless a test explicitly enables epoch grouping.
+    monkeypatch.setenv("ENABLE_EPOCH_GROUP_SETTLEMENT", "false")
 
 
 @pytest.mark.smoke
@@ -202,7 +217,7 @@ def test_run_settlement_cycle_uses_channel_endpoint_when_configured(monkeypatch,
     monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
     monkeypatch.setenv("TRANSLATOR_CHANNELS_URL", "http://127.0.0.1:8080/v1/translator/upstream/channels")
     monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "false")
-    monkeypatch.setenv("REWARD_MODE", "blocks")
+    monkeypatch.setenv("DEMO_FIXED_REWARD_MODE", "true")
     monkeypatch.setenv("BLOCK_REWARD_BTC", "1.87500000")
     monkeypatch.setenv("DRY_RUN", "true")
 
@@ -254,7 +269,7 @@ def test_run_settlement_cycle_uses_channel_endpoint_when_configured(monkeypatch,
             "created_events": 2,
         },
         "block_reward": {
-            "reward_mode": "blocks",
+            "reward_mode": "demo_fixed",
             "block_reward_btc": "1.87500000",
             "interval_blocks": 3,
             "computed_reward_btc": "5.62500000",
@@ -698,8 +713,10 @@ def test_run_settlement_cycle_defers_and_accrues_when_rewards_missing(monkeypatc
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["settlement"]["status"] == "deferred"
+    assert payload["settlement"]["status"] == "blocked"
     assert payload["settlement"]["pool_reward_btc"] == "0.00000000"
+    assert payload["settlement"]["total_shares"] == 5
+    assert payload["settlement"]["total_work"] == "100.00000000"
     assert payload["block_reward"]["reward_mode"] == "block_events"
     assert payload["block_reward"]["matured_hash_count"] == 1
     assert payload["block_reward"]["computed_reward_btc"] == "0.00000000"
@@ -708,13 +725,12 @@ def test_run_settlement_cycle_defers_and_accrues_when_rewards_missing(monkeypatc
     assert payload["block_reward"]["missing_reward_hash_count"] == 1
 
     with Session() as session:
-        settlement = session.query(Settlement).one()
-        assert settlement.status == "deferred"
+        assert session.query(Settlement).count() == 0
         assert session.query(UserPayout).count() == 0
 
         row = session.query(SnapshotBlock).filter(SnapshotBlock.blockhash == "matured-hash-missing").one()
-        assert row.reward_sats == 0
-        assert row.settlement_id == settlement.id
+        assert row.reward_sats is None  # unresolved hash must NOT be clobbered with 0 so it stays in retry set
+        assert row.settlement_id is None
 
         user = session.query(User).filter(User.username == "alice").one()
         bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
@@ -800,27 +816,120 @@ def test_run_settlement_cycle_defers_on_partial_reward_subset(monkeypatch, tmp_p
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["settlement"]["status"] == "deferred"
+    # Partial resolution: hash-1 resolved (1 BTC), hash-2 unresolved.
+    # Policy: if current matured hashes are incomplete, block settlement and retry later.
+    assert payload["settlement"]["status"] == "blocked"
     assert payload["settlement"]["pool_reward_btc"] == "0.00000000"
+    assert payload["settlement"]["total_shares"] == 8
+    assert payload["settlement"]["total_work"] == "160.00000000"
     assert payload["block_reward"]["matured_hash_count"] == 2
     assert payload["block_reward"]["computed_reward_btc"] == "1.00000000"
     assert payload["block_reward"]["settlement_reward_btc"] == "0.00000000"
-    assert payload["block_reward"]["reward_entries_complete"] is False
+    assert payload["block_reward"]["reward_entries_complete"] is False  # diagnostic: hash-2 still missing
     assert payload["block_reward"]["missing_reward_hash_count"] == 1
 
     with Session() as session:
-        settlement = session.query(Settlement).one()
-        assert settlement.status == "deferred"
+        assert session.query(Settlement).count() == 0
         assert session.query(UserPayout).count() == 0
 
         rows = session.query(SnapshotBlock).order_by(SnapshotBlock.blockhash.asc()).all()
         assert [row.blockhash for row in rows] == ["matured-hash-1", "matured-hash-2"]
-        assert [row.reward_sats for row in rows] == [100000000, 0]
-        assert all(row.settlement_id == settlement.id for row in rows)
+        # In blocked cycles, rewards are not persisted yet. Both hashes remain retry-eligible.
+        assert rows[0].reward_sats is None
+        assert rows[1].reward_sats is None
+        assert all(row.settlement_id is None for row in rows)
 
         user = session.query(User).filter(User.username == "alice").one()
         bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
         assert Decimal(str(bucket.accumulated_work)) == Decimal("160.00000000")
+
+
+def test_blocked_retry_does_not_double_accrue_same_window(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "blocked_retry_idempotent.db"
+    log_file = tmp_path / "blocked_retry_idempotent_audit.jsonl"
+    engine = make_engine(str(db_file))
+    Base.metadata.create_all(engine)
+    Session = make_session_factory(engine)
+
+    anchor = datetime.now(UTC).replace(tzinfo=None)
+    window_start = anchor - timedelta(minutes=210)
+    window_end = anchor - timedelta(minutes=200)
+
+    with Session() as session:
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=window_start - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=5,
+                accepted_work_total=100,
+                shares_rejected_total=0,
+                created_at=window_start + timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "true")
+    monkeypatch.setenv("DEFER_ON_ZERO_MATURED_REWARD", "true")
+    monkeypatch.setenv("PAYOUT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("MATURITY_WINDOW_MINUTES", "200")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("TRANSLATOR_CHANNELS_URL", raising=False)
+
+    monkeypatch.setattr("app.main.poll_metrics_once", lambda session, api_url: 0)
+    monkeypatch.setattr("app.main.compute_matured_window", lambda now, interval_minutes, maturity_window_minutes: (window_start, window_end))
+    monkeypatch.setattr(
+        "app.main.fetch_blocks_found_in_window",
+        lambda start, end: [
+            {
+                "found_at": (start + timedelta(minutes=1)).isoformat(),
+                "channel_id": 2,
+                "worker_name": "alice.m1",
+                "blockhash": "blocked-idempotent-hash",
+            }
+        ],
+    )
+    monkeypatch.setattr("app.main.fetch_block_rewards_by_hashes", lambda hashes: {})
+
+    def _fake_process_payout_events(session, dry_run):
+        _ = dry_run
+        session.commit()
+        return SenderStats(attempted=0, sent=0, failed=0, created_events=0)
+
+    monkeypatch.setattr("app.main.process_payout_events", _fake_process_payout_events)
+
+    client = TestClient(app)
+    first = client.post("/settlements/run")
+    second = client.post("/settlements/run")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_payload = first.json()
+    second_payload = second.json()
+    assert first_payload["settlement"]["status"] == "blocked"
+    assert second_payload["settlement"]["status"] == "blocked"
+    assert first_payload["block_reward"]["blocked_accrual_applied_now"] is True
+    assert second_payload["block_reward"]["blocked_accrual_applied_now"] is False
+
+    with Session() as session:
+        user = session.query(User).filter(User.username == "alice").one()
+        bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
+        assert Decimal(str(bucket.accumulated_work)) == Decimal("100.00000000")
+
+        pending = session.query(PendingBlockReward).filter(PendingBlockReward.blockhash == "blocked-idempotent-hash").all()
+        assert len(pending) == 1
+        assert pending[0].paid is False
 
 
 def test_phase5_hooks_are_invoked_only_when_flags_enabled(monkeypatch, tmp_path) -> None:
@@ -1113,14 +1222,13 @@ def test_phase_e_deferred_then_rewarded_recovery_via_settlements_run(monkeypatch
     first = client.post("/settlements/run")
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["settlement"]["status"] == "deferred"
+    assert first_payload["settlement"]["status"] == "blocked"
     assert first_payload["settlement"]["pool_reward_btc"] == "0.00000000"
     assert first_payload["block_reward"]["matured_hash_count"] == 1
+    assert first_payload["settlement"]["total_work"] == "100.00000000"
 
     with Session() as session:
-        first_settlement = session.query(Settlement).order_by(Settlement.id.asc()).one()
-        assert first_settlement.status == "deferred"
-
+        assert session.query(Settlement).count() == 0
         user = session.query(User).filter(User.username == "alice").one()
         bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
         assert Decimal(str(bucket.accumulated_work)) == Decimal("100.00000000")
@@ -1132,7 +1240,7 @@ def test_phase_e_deferred_then_rewarded_recovery_via_settlements_run(monkeypatch
                 accepted_shares_total=7,
                 accepted_work_total=160,
                 shares_rejected_total=0,
-                created_at=first_settlement.period_end + timedelta(minutes=1),
+                created_at=anchor + timedelta(minutes=1),
             )
         )
         session.commit()
@@ -1155,23 +1263,23 @@ def test_phase_e_deferred_then_rewarded_recovery_via_settlements_run(monkeypatch
 
     with Session() as session:
         settlements = session.query(Settlement).order_by(Settlement.id.asc()).all()
-        assert [s.status for s in settlements] == ["deferred", "completed"]
+        assert [s.status for s in settlements] == ["completed"]
 
-        second_settlement = settlements[-1]
+        second_settlement = settlements[0]
         payouts = session.query(UserPayout).filter(UserPayout.settlement_id == second_settlement.id).all()
         assert len(payouts) == 1
         assert Decimal(str(payouts[0].amount_btc)) == Decimal("1.00000000")
 
         user = session.query(User).filter(User.username == "alice").one()
-        bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
-        assert Decimal(str(bucket.accumulated_work)) == Decimal("0")
+        bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).first()
+        assert bucket is None or Decimal(str(bucket.accumulated_work)) == Decimal("0")
 
         rows = session.query(SnapshotBlock).order_by(SnapshotBlock.blockhash.asc()).all()
         assert [r.blockhash for r in rows] == ["phase-e-hash-1", "phase-e-hash-2"]
-        assert rows[0].reward_sats == 0
+        assert rows[0].reward_sats is None  # unresolved hash must NOT be clobbered so retry can pick it up
         assert rows[1].reward_sats == 100000000
-        assert rows[0].settlement_id == settlements[0].id
-        assert rows[1].settlement_id == settlements[1].id
+        assert rows[0].settlement_id is None
+        assert rows[1].settlement_id == settlements[0].id
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1487,87 @@ def test_phase_f_deferred_api_rerun_does_not_double_accrue_work(monkeypatch, tmp
         user = session.query(User).filter(User.username == "alice").one()
         bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
         # Must be exactly 100, not doubled to 200
+        assert Decimal(str(bucket.accumulated_work)) == Decimal("100.00000000")
+
+
+def test_epoch_group_zero_rewards_falls_back_to_deferred_with_accrual(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "epoch_group_zero_rewards.db"
+    log_file = tmp_path / "epoch_group_zero_rewards_audit.jsonl"
+    engine = make_engine(str(db_file))
+    Base.metadata.create_all(engine)
+    Session = make_session_factory(engine)
+
+    anchor = datetime.now(UTC).replace(tzinfo=None)
+    with Session() as session:
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=anchor - timedelta(minutes=12),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=5,
+                accepted_work_total=100,
+                shares_rejected_total=0,
+                created_at=anchor - timedelta(minutes=2),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "true")
+    monkeypatch.setenv("ENABLE_EPOCH_GROUP_SETTLEMENT", "true")
+    monkeypatch.setenv("DEFER_ON_ZERO_MATURED_REWARD", "true")
+    monkeypatch.setenv("PAYOUT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("TRANSLATOR_CHANNELS_URL", raising=False)
+
+    monkeypatch.setattr("app.main.poll_metrics_once", lambda session, api_url: 0)
+    monkeypatch.setattr(
+        "app.main.compute_matured_window",
+        lambda now, interval_minutes, maturity_window_minutes: (
+            anchor - timedelta(minutes=5),
+            anchor,
+        ),
+    )
+    monkeypatch.setattr("app.main.fetch_blocks_found_in_window", lambda start, end: [])
+    monkeypatch.setattr("app.main.fetch_block_rewards_by_hashes", lambda hashes: {})
+    monkeypatch.setattr(
+        "app.main.process_payout_events",
+        lambda session, dry_run: (
+            session.commit() or SenderStats(attempted=0, sent=0, failed=0, created_events=0)
+        ),
+    )
+
+    fixed_now = anchor.replace(tzinfo=UTC)
+
+    class _FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return fixed_now
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime)
+
+    client = TestClient(app)
+    response = client.post("/settlements/run")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["settlement"]["status"] == "deferred"
+
+    with Session() as session:
+        assert session.query(Settlement).count() == 1
+        user = session.query(User).filter(User.username == "alice").one()
+        bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == user.id).one()
         assert Decimal(str(bucket.accumulated_work)) == Decimal("100.00000000")
 
 

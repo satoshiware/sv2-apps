@@ -5,9 +5,17 @@ from pathlib import Path
 import pytest
 
 from app.db import Base, make_engine, make_session_factory
-from app.models import CarryState, MetricSnapshot, Settlement, User, UserPayout, WorkAccrualBucket
+from app.models import (
+    CarryState,
+    MetricSnapshot,
+    PendingBlockReward,
+    Settlement,
+    User,
+    UserPayout,
+    WorkAccrualBucket,
+)
 from app.pool_client import PoolApiTimeout
-from app.settlement import run_settlement
+from app.settlement import accrue_work_epoch_once, run_epoch_group_settlement, run_settlement
 
 
 @pytest.fixture
@@ -251,6 +259,118 @@ def test_run_settlement_uses_contiguous_non_overlapping_periods(session) -> None
     assert first.period_end == first_now
     assert second.period_start == first.period_end
     assert second.period_end == second_now
+
+
+@pytest.mark.smoke
+def test_run_epoch_group_settlement_keeps_old_and_current_basis_separate(session) -> None:
+    old_start = datetime(2026, 1, 1, 0, 0, 0)
+    old_end = datetime(2026, 1, 1, 0, 10, 0)
+    cur_start = datetime(2026, 1, 1, 0, 10, 0)
+    cur_end = datetime(2026, 1, 1, 0, 20, 0)
+
+    _add_snapshot(session, "alice.m1", 0, old_start - timedelta(minutes=1), channel_id=1, work_total=0)
+    _add_snapshot(session, "alice.m1", 10, old_start + timedelta(minutes=1), channel_id=1, work_total=100)
+
+    _add_snapshot(session, "bob.m1", 0, cur_start - timedelta(minutes=1), channel_id=2, work_total=0)
+    _add_snapshot(session, "bob.m1", 20, cur_start + timedelta(minutes=1), channel_id=2, work_total=200)
+    session.commit()
+
+    old_epoch, _, _, _ = accrue_work_epoch_once(
+        session,
+        window_start=old_start,
+        window_end=old_end,
+        now=old_end,
+        decimals=8,
+    )
+    cur_epoch, _, _, _ = accrue_work_epoch_once(
+        session,
+        window_start=cur_start,
+        window_end=cur_end,
+        now=cur_end,
+        decimals=8,
+    )
+
+    session.add(
+        PendingBlockReward(
+            blockhash="old-unresolved-hash",
+            found_at=old_start + timedelta(minutes=2),
+            epoch_id=old_epoch.id,
+            reward_sats=None,
+            resolved_at=None,
+            paid=False,
+            paid_settlement_id=None,
+            created_at=old_end,
+            updated_at=old_end,
+        )
+    )
+    session.add(
+        PendingBlockReward(
+            blockhash="current-resolved-hash",
+            found_at=cur_start + timedelta(minutes=2),
+            epoch_id=cur_epoch.id,
+            reward_sats=100_000_000,
+            resolved_at=cur_end,
+            paid=False,
+            paid_settlement_id=None,
+            created_at=cur_end,
+            updated_at=cur_end,
+        )
+    )
+    session.commit()
+
+    first = run_epoch_group_settlement(
+        session,
+        now=cur_end,
+        epoch_reward_sats={cur_epoch.id: 100_000_000},
+        interval_minutes=10,
+        payout_decimals=8,
+    )
+    assert first.status == "completed"
+    assert first.pool_reward_btc == Decimal("1.00000000")
+
+    first_payouts = (
+        session.query(UserPayout, User)
+        .join(User, User.id == UserPayout.user_id)
+        .filter(UserPayout.settlement_id == first.settlement_id)
+        .all()
+    )
+    assert len(first_payouts) == 1
+    assert first_payouts[0][1].username == "bob"
+    assert Decimal(str(first_payouts[0][0].amount_btc)) == Decimal("1.00000000")
+
+    old_pending = session.query(PendingBlockReward).filter_by(blockhash="old-unresolved-hash").one()
+    current_pending = session.query(PendingBlockReward).filter_by(blockhash="current-resolved-hash").one()
+    assert old_pending.paid is False
+    assert current_pending.paid is True
+
+    old_pending.reward_sats = 50_000_000
+    old_pending.resolved_at = datetime(2026, 1, 1, 0, 30, 0)
+    session.commit()
+
+    second_now = datetime(2026, 1, 1, 0, 30, 0)
+    second = run_epoch_group_settlement(
+        session,
+        now=second_now,
+        epoch_reward_sats={old_epoch.id: 50_000_000},
+        interval_minutes=10,
+        payout_decimals=8,
+    )
+    assert second.status == "completed"
+    assert second.pool_reward_btc == Decimal("0.50000000")
+
+    second_payouts = (
+        session.query(UserPayout, User)
+        .join(User, User.id == UserPayout.user_id)
+        .filter(UserPayout.settlement_id == second.settlement_id)
+        .all()
+    )
+    assert len(second_payouts) == 1
+    assert second_payouts[0][1].username == "alice"
+    assert Decimal(str(second_payouts[0][0].amount_btc)) == Decimal("0.50000000")
+
+    old_pending = session.query(PendingBlockReward).filter_by(blockhash="old-unresolved-hash").one()
+    assert old_pending.paid is True
+    assert old_pending.paid_settlement_id == second.settlement_id
 
 
 # ---------------------------------------------------------------------------

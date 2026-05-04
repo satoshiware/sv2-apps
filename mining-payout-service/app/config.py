@@ -44,6 +44,7 @@ class Settings:
     pool_api_key: str = ""
     reward_mode: str = "blocks"
     block_reward_btc: str = "1.87500000"
+    demo_fixed_reward_mode: bool = False
     enable_block_event_rewards: bool = False
     maturity_window_minutes: int = 200
     block_reward_batch_url: str = ""
@@ -52,7 +53,7 @@ class Settings:
     translator_blocks_found_url: str = ""
     translator_blocks_found_timeout_seconds: int = 10
     translator_blocks_found_limit: int = 100
-    translator_blocks_found_candidate_window_seconds: int = 30
+    translator_blocks_found_candidate_window_seconds: int = 300
     translator_blocks_found_candidate_limit: int = 5
     translator_metrics_url: str = "http://127.0.0.1:9092/metrics"
     translator_channels_url: str = ""
@@ -62,6 +63,7 @@ class Settings:
     enable_block_event_replay_hook: bool = False
     enable_reward_refetch_hook: bool = False
     enable_settlement_replay_hook: bool = False
+    enable_epoch_group_settlement: bool = False
     payout_audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 60
@@ -85,6 +87,10 @@ def load_settings() -> Settings:
         pool_api_key=os.getenv("POOL_API_KEY", ""),
         reward_mode=os.getenv("REWARD_MODE", "blocks"),
         block_reward_btc=os.getenv("BLOCK_REWARD_BTC", "1.87500000"),
+        demo_fixed_reward_mode=_parse_env_bool(
+            os.getenv("DEMO_FIXED_REWARD_MODE"),
+            default=False,
+        ),
         enable_block_event_rewards=_parse_env_bool(
             os.getenv("ENABLE_BLOCK_EVENT_REWARDS"),
             default=False,
@@ -104,7 +110,7 @@ def load_settings() -> Settings:
         ),
         translator_blocks_found_limit=int(os.getenv("TRANSLATOR_BLOCKS_FOUND_LIMIT", "100")),
         translator_blocks_found_candidate_window_seconds=int(
-            os.getenv("TRANSLATOR_BLOCKS_FOUND_CANDIDATE_WINDOW_SECONDS", "30")
+            os.getenv("TRANSLATOR_BLOCKS_FOUND_CANDIDATE_WINDOW_SECONDS", "300")
         ),
         translator_blocks_found_candidate_limit=int(
             os.getenv("TRANSLATOR_BLOCKS_FOUND_CANDIDATE_LIMIT", "5")
@@ -127,6 +133,10 @@ def load_settings() -> Settings:
         ),
         enable_settlement_replay_hook=_parse_env_bool(
             os.getenv("ENABLE_SETTLEMENT_REPLAY_HOOK"),
+            default=False,
+        ),
+        enable_epoch_group_settlement=_parse_env_bool(
+            os.getenv("ENABLE_EPOCH_GROUP_SETTLEMENT"),
             default=False,
         ),
         payout_audit_log_path=resolved_audit_log_path,
