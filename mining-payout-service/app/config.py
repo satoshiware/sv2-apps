@@ -64,6 +64,7 @@ class Settings:
     enable_reward_refetch_hook: bool = False
     enable_settlement_replay_hook: bool = False
     enable_epoch_group_settlement: bool = False
+    strict_work_basis_required: bool = False
     payout_audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 60
@@ -137,6 +138,10 @@ def load_settings() -> Settings:
         ),
         enable_epoch_group_settlement=_parse_env_bool(
             os.getenv("ENABLE_EPOCH_GROUP_SETTLEMENT"),
+            default=False,
+        ),
+        strict_work_basis_required=_parse_env_bool(
+            os.getenv("STRICT_WORK_BASIS_REQUIRED"),
             default=False,
         ),
         payout_audit_log_path=resolved_audit_log_path,

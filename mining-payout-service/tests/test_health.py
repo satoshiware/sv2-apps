@@ -33,6 +33,7 @@ from app.settlement import SettlementResult
 def _default_disable_epoch_group_settlement(monkeypatch) -> None:
     # Keep legacy expectations stable unless a test explicitly enables epoch grouping.
     monkeypatch.setenv("ENABLE_EPOCH_GROUP_SETTLEMENT", "false")
+    monkeypatch.setenv("STRICT_WORK_BASIS_REQUIRED", "false")
 
 
 @pytest.mark.smoke
@@ -1280,6 +1281,581 @@ def test_phase_e_deferred_then_rewarded_recovery_via_settlements_run(monkeypatch
         assert rows[1].reward_sats == 100000000
         assert rows[0].settlement_id is None
         assert rows[1].settlement_id == settlements[0].id
+
+
+def test_matrix_deferred_then_rewarded_uses_accrued_plus_current_work(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "matrix_deferred_then_rewarded.db"
+    log_file = tmp_path / "matrix_deferred_then_rewarded_audit.jsonl"
+    engine = make_engine(str(db_file))
+    Base.metadata.create_all(engine)
+    Session = make_session_factory(engine)
+
+    w1_start = datetime(2026, 1, 1, 0, 0, 0)
+    w1_end = datetime(2026, 1, 1, 0, 10, 0)
+    w2_start = datetime(2026, 1, 1, 0, 10, 0)
+    w2_end = datetime(2026, 1, 1, 0, 20, 0)
+
+    with Session() as session:
+        # Baseline before cycle 1.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 1 deltas: alice=100, bob=100 (deferred because no matured reward).
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=10,
+                accepted_work_total=100,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=10,
+                accepted_work_total=100,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 2 new deltas: alice=50, bob=150.
+        # Effective payout basis at reward time should be:
+        # alice=100+50=150, bob=100+150=250.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=15,
+                accepted_work_total=150,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=25,
+                accepted_work_total=250,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "true")
+    monkeypatch.setenv("DEFER_ON_ZERO_MATURED_REWARD", "true")
+    monkeypatch.setenv("PAYOUT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("TRANSLATOR_CHANNELS_URL", raising=False)
+
+    monkeypatch.setattr("app.main.poll_metrics_once", lambda session, api_url: 0)
+
+    window_calls = {"n": 0}
+
+    def _matured_window(now, interval_minutes, maturity_window_minutes):
+        _ = (now, interval_minutes, maturity_window_minutes)
+        window_calls["n"] += 1
+        if window_calls["n"] == 1:
+            return w1_start, w1_end
+        return w2_start, w2_end
+
+    monkeypatch.setattr("app.main.compute_matured_window", _matured_window)
+
+    block_calls = {"n": 0}
+
+    def _blocks_found(start, end):
+        _ = (start, end)
+        block_calls["n"] += 1
+        if block_calls["n"] == 1:
+            return []
+        return [
+            {
+                "found_at": (w2_start + timedelta(minutes=2)).isoformat(),
+                "channel_id": 2,
+                "worker_name": "alice.m1",
+                "blockhash": "matrix-hash-cycle2",
+            }
+        ]
+
+    monkeypatch.setattr("app.main.fetch_blocks_found_in_window", _blocks_found)
+    monkeypatch.setattr(
+        "app.main.fetch_block_rewards_by_hashes",
+        lambda hashes: {"matrix-hash-cycle2": 100_000_000} if "matrix-hash-cycle2" in hashes else {},
+    )
+    monkeypatch.setattr(
+        "app.main.process_payout_events",
+        lambda session, dry_run: (
+            session.commit() or SenderStats(attempted=0, sent=0, failed=0, created_events=0)
+        ),
+    )
+
+    class _FixedDateTime1:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w1_end.replace(tzinfo=UTC)
+
+    class _FixedDateTime2:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w2_end.replace(tzinfo=UTC)
+
+    client = TestClient(app)
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime1)
+    first = client.post("/settlements/run")
+    assert first.status_code == 200
+    assert first.json()["settlement"]["status"] == "deferred"
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime2)
+    second = client.post("/settlements/run")
+    assert second.status_code == 200
+    assert second.json()["settlement"]["status"] == "completed"
+
+    with Session() as session:
+        latest = session.query(Settlement).order_by(Settlement.id.desc()).first()
+        assert latest is not None
+        payouts = (
+            session.query(UserPayout, User)
+            .join(User, User.id == UserPayout.user_id)
+            .filter(UserPayout.settlement_id == latest.id)
+            .all()
+        )
+        payout_by_user = {user.username: Decimal(str(payout.amount_btc)) for payout, user in payouts}
+
+        assert payout_by_user["alice"] == Decimal("0.37500000")
+        assert payout_by_user["bob"] == Decimal("0.62500000")
+
+
+def test_matrix_awarded_then_no_reward_accrues_only_current_cycle_work(monkeypatch, tmp_path) -> None:
+    db_file = tmp_path / "matrix_awarded_then_no_reward.db"
+    log_file = tmp_path / "matrix_awarded_then_no_reward_audit.jsonl"
+    engine = make_engine(str(db_file))
+    Base.metadata.create_all(engine)
+    Session = make_session_factory(engine)
+
+    w1_start = datetime(2026, 1, 1, 1, 0, 0)
+    w1_end = datetime(2026, 1, 1, 1, 10, 0)
+    w2_start = datetime(2026, 1, 1, 1, 10, 0)
+    w2_end = datetime(2026, 1, 1, 1, 20, 0)
+
+    with Session() as session:
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 1 rewarded deltas.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=7,
+                accepted_work_total=70,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=3,
+                accepted_work_total=30,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 2 additional deltas: alice=20, bob=80.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=9,
+                accepted_work_total=90,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=11,
+                accepted_work_total=110,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "true")
+    monkeypatch.setenv("DEFER_ON_ZERO_MATURED_REWARD", "true")
+    monkeypatch.setenv("PAYOUT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("TRANSLATOR_CHANNELS_URL", raising=False)
+
+    monkeypatch.setattr("app.main.poll_metrics_once", lambda session, api_url: 0)
+
+    window_calls = {"n": 0}
+
+    def _matured_window(now, interval_minutes, maturity_window_minutes):
+        _ = (now, interval_minutes, maturity_window_minutes)
+        window_calls["n"] += 1
+        if window_calls["n"] == 1:
+            return w1_start, w1_end
+        return w2_start, w2_end
+
+    monkeypatch.setattr("app.main.compute_matured_window", _matured_window)
+
+    block_calls = {"n": 0}
+
+    def _blocks_found(start, end):
+        _ = (start, end)
+        block_calls["n"] += 1
+        if block_calls["n"] == 1:
+            return [
+                {
+                    "found_at": (w1_start + timedelta(minutes=2)).isoformat(),
+                    "channel_id": 2,
+                    "worker_name": "alice.m1",
+                    "blockhash": "matrix-awarded-hash",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("app.main.fetch_blocks_found_in_window", _blocks_found)
+    monkeypatch.setattr(
+        "app.main.fetch_block_rewards_by_hashes",
+        lambda hashes: {"matrix-awarded-hash": 100_000_000} if "matrix-awarded-hash" in hashes else {},
+    )
+    monkeypatch.setattr(
+        "app.main.process_payout_events",
+        lambda session, dry_run: (
+            session.commit() or SenderStats(attempted=0, sent=0, failed=0, created_events=0)
+        ),
+    )
+
+    class _FixedDateTime1:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w1_end.replace(tzinfo=UTC)
+
+    class _FixedDateTime2:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w2_end.replace(tzinfo=UTC)
+
+    client = TestClient(app)
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime1)
+    first = client.post("/settlements/run")
+    assert first.status_code == 200
+    assert first.json()["settlement"]["status"] == "completed"
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime2)
+    second = client.post("/settlements/run")
+    assert second.status_code == 200
+    assert second.json()["settlement"]["status"] == "deferred"
+
+    with Session() as session:
+        alice = session.query(User).filter(User.username == "alice").one()
+        bob = session.query(User).filter(User.username == "bob").one()
+        alice_bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == alice.id).one()
+        bob_bucket = session.query(WorkAccrualBucket).filter(WorkAccrualBucket.user_id == bob.id).one()
+
+        assert Decimal(str(alice_bucket.accumulated_work)) == Decimal("20.00000000")
+        assert Decimal(str(bob_bucket.accumulated_work)) == Decimal("80.00000000")
+
+
+def test_matrix_awarded_then_partial_blocks_then_recovery_pays_from_blocked_window_work(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    db_file = tmp_path / "matrix_awarded_partial_recovery.db"
+    log_file = tmp_path / "matrix_awarded_partial_recovery_audit.jsonl"
+    engine = make_engine(str(db_file))
+    Base.metadata.create_all(engine)
+    Session = make_session_factory(engine)
+
+    w1_start = datetime(2026, 1, 1, 2, 0, 0)
+    w1_end = datetime(2026, 1, 1, 2, 10, 0)
+    w2_start = datetime(2026, 1, 1, 2, 10, 0)
+    w2_end = datetime(2026, 1, 1, 2, 20, 0)
+    w3_start = datetime(2026, 1, 1, 2, 20, 0)
+    w3_end = datetime(2026, 1, 1, 2, 30, 0)
+
+    with Session() as session:
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=0,
+                accepted_work_total=0,
+                shares_rejected_total=0,
+                created_at=w1_start - timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 1 rewarded: alice=50, bob=50.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=5,
+                accepted_work_total=50,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=5,
+                accepted_work_total=50,
+                shares_rejected_total=0,
+                created_at=w1_start + timedelta(minutes=1),
+            )
+        )
+
+        # Cycle 2 blocked-partial window deltas: alice=120, bob=80.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=17,
+                accepted_work_total=170,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=13,
+                accepted_work_total=130,
+                shares_rejected_total=0,
+                created_at=w2_start + timedelta(minutes=1),
+            )
+        )
+
+        # No new work in cycle 3; payout should come from stored blocked window basis.
+        session.add(
+            MetricSnapshot(
+                channel_id=2,
+                identity="alice.m1",
+                accepted_shares_total=17,
+                accepted_work_total=170,
+                shares_rejected_total=0,
+                created_at=w3_start + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                channel_id=3,
+                identity="bob.m1",
+                accepted_shares_total=13,
+                accepted_work_total=130,
+                shares_rejected_total=0,
+                created_at=w3_start + timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("PAYOUT_AUDIT_LOG_PATH", str(log_file))
+    monkeypatch.setenv("ENABLE_BLOCK_EVENT_REWARDS", "true")
+    monkeypatch.setenv("DEFER_ON_ZERO_MATURED_REWARD", "true")
+    monkeypatch.setenv("PAYOUT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("TRANSLATOR_CHANNELS_URL", raising=False)
+
+    monkeypatch.setattr("app.main.poll_metrics_once", lambda session, api_url: 0)
+
+    window_calls = {"n": 0}
+
+    def _matured_window(now, interval_minutes, maturity_window_minutes):
+        _ = (now, interval_minutes, maturity_window_minutes)
+        window_calls["n"] += 1
+        if window_calls["n"] == 1:
+            return w1_start, w1_end
+        if window_calls["n"] == 2:
+            return w2_start, w2_end
+        return w3_start, w3_end
+
+    monkeypatch.setattr("app.main.compute_matured_window", _matured_window)
+
+    block_calls = {"n": 0}
+
+    def _blocks_found(start, end):
+        _ = (start, end)
+        block_calls["n"] += 1
+        if block_calls["n"] == 1:
+            return [
+                {
+                    "found_at": (w1_start + timedelta(minutes=2)).isoformat(),
+                    "channel_id": 2,
+                    "worker_name": "alice.m1",
+                    "blockhash": "matrix-c1",
+                }
+            ]
+        if block_calls["n"] == 2:
+            return [
+                {
+                    "found_at": (w2_start + timedelta(minutes=2)).isoformat(),
+                    "channel_id": 2,
+                    "worker_name": "alice.m1",
+                    "blockhash": "matrix-c2-a",
+                },
+                {
+                    "found_at": (w2_start + timedelta(minutes=3)).isoformat(),
+                    "channel_id": 3,
+                    "worker_name": "bob.m1",
+                    "blockhash": "matrix-c2-b",
+                },
+            ]
+        return []
+
+    monkeypatch.setattr("app.main.fetch_blocks_found_in_window", _blocks_found)
+
+    reward_calls = {"n": 0}
+
+    def _fetch_rewards(hashes):
+        reward_calls["n"] += 1
+        if reward_calls["n"] == 1:
+            return {"matrix-c1": 100_000_000}
+        if reward_calls["n"] == 2:
+            return {"matrix-c2-a": 50_000_000}
+        # Recovery cycle resolves the previously missing hash.
+        if "matrix-c2-a" in hashes and "matrix-c2-b" in hashes:
+            return {"matrix-c2-a": 50_000_000, "matrix-c2-b": 50_000_000}
+        return {}
+
+    monkeypatch.setattr("app.main.fetch_block_rewards_by_hashes", _fetch_rewards)
+    monkeypatch.setattr(
+        "app.main.process_payout_events",
+        lambda session, dry_run: (
+            session.commit() or SenderStats(attempted=0, sent=0, failed=0, created_events=0)
+        ),
+    )
+
+    class _FixedDateTime1:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w1_end.replace(tzinfo=UTC)
+
+    class _FixedDateTime2:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w2_end.replace(tzinfo=UTC)
+
+    class _FixedDateTime3:
+        @classmethod
+        def now(cls, tz=None):
+            _ = tz
+            return w3_end.replace(tzinfo=UTC)
+
+    client = TestClient(app)
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime1)
+    first = client.post("/settlements/run")
+    assert first.status_code == 200
+    assert first.json()["settlement"]["status"] == "completed"
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime2)
+    second = client.post("/settlements/run")
+    assert second.status_code == 200
+    assert second.json()["settlement"]["status"] == "blocked"
+
+    monkeypatch.setattr("app.main.datetime", _FixedDateTime3)
+    third = client.post("/settlements/run")
+    assert third.status_code == 200
+    assert third.json()["settlement"]["status"] == "completed"
+
+    with Session() as session:
+        settlements = session.query(Settlement).order_by(Settlement.id.asc()).all()
+        assert [s.status for s in settlements] == ["completed", "completed"]
+
+        recovery = settlements[-1]
+        payouts = (
+            session.query(UserPayout, User)
+            .join(User, User.id == UserPayout.user_id)
+            .filter(UserPayout.settlement_id == recovery.id)
+            .all()
+        )
+        payout_by_user = {user.username: Decimal(str(payout.amount_btc)) for payout, user in payouts}
+
+        # Blocked cycle work basis was alice=120, bob=80 => 60/40 split on 1 BTC.
+        assert payout_by_user["alice"] == Decimal("0.60000000")
+        assert payout_by_user["bob"] == Decimal("0.40000000")
+
+        pending_rows = (
+            session.query(PendingBlockReward)
+            .filter(PendingBlockReward.blockhash.in_(["matrix-c2-a", "matrix-c2-b"]))
+            .all()
+        )
+        assert len(pending_rows) == 2
 
 
 # ---------------------------------------------------------------------------

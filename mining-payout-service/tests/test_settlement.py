@@ -28,6 +28,11 @@ def session(tmp_path: Path):
         yield s
 
 
+@pytest.fixture(autouse=True)
+def _default_disable_strict_work_basis(monkeypatch) -> None:
+    monkeypatch.setenv("STRICT_WORK_BASIS_REQUIRED", "false")
+
+
 def _add_snapshot(
     session,
     identity: str,
@@ -259,6 +264,97 @@ def test_run_settlement_uses_contiguous_non_overlapping_periods(session) -> None
     assert first.period_end == first_now
     assert second.period_start == first.period_end
     assert second.period_end == second_now
+
+
+def test_run_settlement_blocks_when_strict_work_basis_and_no_positive_work(
+    session,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STRICT_WORK_BASIS_REQUIRED", "true")
+
+    now = datetime(2026, 1, 1, 5, 30, 0)
+    start = now - timedelta(minutes=10)
+
+    _add_snapshot(session, "alice.m1", 10, start - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "alice.m1", 20, start + timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "bob.m1", 5, start - timedelta(minutes=1), work_total=0)
+    _add_snapshot(session, "bob.m1", 15, start + timedelta(minutes=2), work_total=0)
+    session.commit()
+
+    def _reward_fetcher(period_start, period_end):
+        _ = (period_start, period_end)
+        return 0.01000000
+
+    result = run_settlement(
+        session,
+        now,
+        interval_minutes=10,
+        payout_decimals=8,
+        reward_fetcher=_reward_fetcher,
+    )
+
+    settlement = session.query(Settlement).one()
+
+    assert result.status == "blocked"
+    assert settlement.status == "blocked"
+    assert result.total_work == Decimal("0")
+    assert session.query(UserPayout).count() == 0
+
+
+def test_run_epoch_group_settlement_blocks_when_strict_work_basis_and_no_positive_work(
+    session,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STRICT_WORK_BASIS_REQUIRED", "true")
+
+    window_start = datetime(2026, 1, 1, 5, 40, 0)
+    window_end = datetime(2026, 1, 1, 5, 50, 0)
+
+    # Shares increase but reported work remains zero for the full window.
+    _add_snapshot(session, "alice.m1", 0, window_start - timedelta(minutes=1), channel_id=1, work_total=0)
+    _add_snapshot(session, "alice.m1", 10, window_start + timedelta(minutes=1), channel_id=1, work_total=0)
+    session.commit()
+
+    epoch, _, _, _ = accrue_work_epoch_once(
+        session,
+        window_start=window_start,
+        window_end=window_end,
+        now=window_end,
+        decimals=8,
+    )
+
+    session.add(
+        PendingBlockReward(
+            blockhash="strict-zero-work-epoch",
+            found_at=window_start + timedelta(minutes=2),
+            epoch_id=epoch.id,
+            reward_sats=100_000_000,
+            resolved_at=window_end,
+            paid=False,
+            paid_settlement_id=None,
+            created_at=window_end,
+            updated_at=window_end,
+        )
+    )
+    session.commit()
+
+    result = run_epoch_group_settlement(
+        session,
+        now=window_end,
+        epoch_reward_sats={epoch.id: 100_000_000},
+        interval_minutes=10,
+        payout_decimals=8,
+    )
+
+    pending = session.query(PendingBlockReward).filter_by(blockhash="strict-zero-work-epoch").one()
+    settlement = session.query(Settlement).one()
+
+    assert result.status == "blocked"
+    assert settlement.status == "blocked"
+    assert result.total_work == Decimal("0")
+    assert session.query(UserPayout).count() == 0
+    assert pending.paid is False
+    assert pending.paid_settlement_id is None
 
 
 @pytest.mark.smoke

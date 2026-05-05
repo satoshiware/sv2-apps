@@ -295,6 +295,8 @@ def _build_allocation_rows(
     user_contributions: dict[str, UserContribution],
     distributable: Decimal,
     decimals: int,
+    *,
+    strict_work_basis_required: bool = False,
 ) -> list[dict[str, Decimal | str]]:
     positive_work = {
         username: contribution.work_delta
@@ -304,6 +306,8 @@ def _build_allocation_rows(
     if positive_work:
         basis = positive_work
     else:
+        if strict_work_basis_required:
+            return []
         basis = {
             username: Decimal(contribution.share_delta)
             for username, contribution in user_contributions.items()
@@ -461,15 +465,37 @@ def run_settlement(
     if use_work_accrual:
         user_contributions = _apply_accrual_to_contributions(session, user_contributions)
 
+    _, effective_total_work = _summarize_contributions(user_contributions)
+
     carry = _get_or_create_carry(session)
     previous_carry = _q(Decimal(str(carry.carry_btc or 0)), decimals)
     distributable = _q(pool_reward + previous_carry, decimals)
+
+    if settings.strict_work_basis_required and distributable > ZERO and effective_total_work <= ZERO:
+        settlement.status = "blocked"
+        session.commit()
+        return SettlementResult(
+            settlement_id=settlement.id,
+            status=settlement.status,
+            user_count=0,
+            period_start=period_start,
+            period_end=period_end,
+            total_shares=total_shares,
+            total_work=_q(effective_total_work, decimals),
+            pool_reward_btc=pool_reward,
+            carry_btc=previous_carry,
+        )
 
     allocated_sum = ZERO
     user_count = 0
     settled_usernames: list[str] = []
 
-    allocation_rows = _build_allocation_rows(user_contributions, distributable, decimals)
+    allocation_rows = _build_allocation_rows(
+        user_contributions,
+        distributable,
+        decimals,
+        strict_work_basis_required=settings.strict_work_basis_required,
+    )
     for row in allocation_rows:
         payout_amount = Decimal(str(row["payout_amount"]))
         if payout_amount <= ZERO:
@@ -623,7 +649,12 @@ def run_epoch_group_settlement(
             total_shares += share_delta
             total_work += work_delta
 
-        allocation_rows = _build_allocation_rows(epoch_contributions, epoch_reward, decimals)
+        allocation_rows = _build_allocation_rows(
+            epoch_contributions,
+            epoch_reward,
+            decimals,
+            strict_work_basis_required=settings.strict_work_basis_required,
+        )
         for row in allocation_rows:
             username = str(row["username"])
             payout_amount = Decimal(str(row["payout_amount"]))
@@ -634,6 +665,22 @@ def run_epoch_group_settlement(
             user_basis_totals[username] = _q(user_basis_totals.get(username, ZERO) + basis_value, decimals)
 
     distributable = _q(sum(reward_btc_by_epoch.values(), ZERO), decimals)
+
+    if settings.strict_work_basis_required and distributable > ZERO and total_work <= ZERO:
+        settlement.status = "blocked"
+        session.commit()
+        return SettlementResult(
+            settlement_id=settlement.id,
+            status=settlement.status,
+            user_count=0,
+            period_start=period_start,
+            period_end=period_end,
+            total_shares=int(total_shares),
+            total_work=_q(total_work, decimals),
+            pool_reward_btc=Decimal(str(settlement.pool_reward_btc or 0)),
+            carry_btc=previous_carry,
+        )
+
     allocated_sum = ZERO
     user_count = 0
     settled_usernames: list[str] = []
